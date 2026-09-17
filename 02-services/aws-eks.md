@@ -332,7 +332,7 @@ Checked directly rather than assumed, because [[research-brief]] flags Calgary a
 > ```
 > Run this before the CA pair design is finalised. If the primary `ca-central-1` node groups use an instance family that Calgary does not have, that is a **hard blocker discovered at the worst possible moment**, and the fix — re-benchmarking the workload on a different family — is not a 15-minute fix. This is the single highest-priority verification item in this note. Carry it into [[region-pair-selection]].
 
-**Broader `ca-west-1` caution:** a young region with 70 services at launch is a region where *something else* in the stack is more likely to be missing. EKS itself is fine. Check every other service in [[research-brief]]'s scope list against Calgary individually — notably [[aws-elasticache]], [[aws-eventbridge]], [[aws-backup]] and EFS replication (**confirmed missing in `ca-west-1`** — see [[eks-stateful-workloads]]).
+**Broader `ca-west-1` caution:** a young region with 70 services at launch is a region where *something else* in the stack is more likely to be missing. EKS itself is fine. Check every other service in [[research-brief]]'s scope list against Calgary individually — notably [[aws-elasticache]], [[aws-eventbridge]] and [[aws-backup]]. EFS, at least, is **fine**: `elasticfilesystem.ca-west-1.amazonaws.com` exists and EFS replication is available in every region where EFS is available — see [[eks-stateful-workloads]]. Do not take third-party "supported regions" lists at face value here; several still quote the 2023 launch list.
 
 ## Terraform implementation
 
