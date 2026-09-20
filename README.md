@@ -1,7 +1,7 @@
 ---
 title: Helios — Index
 tags: [moc, index]
-updated: 2026-09-17
+updated: 2026-09-20
 ---
 
 # Helios
@@ -44,6 +44,8 @@ Of what's written so far, these four carry the most leverage:
 - [[aws-route53]] — where the 15-minute RTO is actually won or lost.
 - [[region-pair-selection]] — whether the CA pair survives contact with
   `ca-west-1`'s service parity.
+- [[aws-cognito]] — if Cognito is in the estate, this is plausibly the hardest
+  blocker in the programme, and it is not fixable with Terraform.
 
 ## Status
 
@@ -53,39 +55,84 @@ with [[aws-kms]] since so much leans on it.
 
 ### Services — `02-services/`
 
+**Edge, DNS, delivery**
+
 | Note | Status |
 |---|---|
 | [[aws-acm]] | ✅ |
 | [[aws-route53]] | ✅ |
 | [[aws-alb-nlb]] | ✅ |
-| [[aws-cloudfront]] | 🔄 in flight |
+| [[aws-cloudfront]] | 🟡 **partial** — TL;DR only; see its "Still to research" |
+| [[aws-api-gateway]] | ✅ |
+| [[aws-global-accelerator]] | ⬜ — should pick the winner vs Route 53 / origin groups |
+| [[aws-waf-shield]] | ⬜ — referenced by several notes, never written |
+
+**Data stores**
+
+| Note | Status |
+|---|---|
 | [[aws-rds-postgres]] | ✅ |
 | [[aws-aurora-global-database]] | ✅ |
 | [[rds-vs-aurora-decision]] | ✅ |
 | [[aws-dynamodb]] | ✅ |
 | [[dynamodb-table-naming-migration]] | ✅ — unblocks work in progress |
-| [[aws-elasticache-redis]] | ⬜ |
+| [[aws-elasticache-redis]] | ✅ |
+| [[redis-self-managed-vs-elasticache]] | ⬜ — **container vs managed, explicitly wanted** |
+| [[aws-memorydb]] | ⬜ |
+| [[aws-opensearch]] | ✅ |
+
+**Compute and delivery**
+
+| Note | Status |
+|---|---|
 | [[aws-eks]] | ✅ |
 | [[eks-workload-delivery]] | ✅ |
 | [[eks-stateful-workloads]] | ⬜ |
-| [[aws-ecr]] | 🔄 in flight |
+| [[aws-ecr]] | ⬜ — **lost in a cut-off wave, re-research** |
+| [[aws-lambda]] | ✅ |
+| [[aws-step-functions]] | ⬜ |
+
+**Messaging and streaming**
+
+| Note | Status |
+|---|---|
 | [[aws-sqs]] | ✅ |
 | [[messaging-in-flight-data-loss]] | ✅ |
 | [[aws-eventbridge]] | ✅ |
 | [[aws-sns]] | ⬜ |
+| [[aws-msk-kafka]] | ⬜ |
+| [[aws-kinesis]] | ⬜ |
+
+**Security, identity, config**
+
+| Note | Status |
+|---|---|
 | [[aws-kms]] | ✅ |
 | [[kms-when-to-use-multi-region-keys]] | ✅ |
 | [[aws-secrets-manager]] | ✅ |
 | [[aws-ssm-parameter-store]] | ✅ |
-| [[aws-api-gateway]] | 🔄 in flight |
-| [[aws-lambda]] | 🔄 in flight |
-| [[aws-s3]] | 🔄 in flight |
+| [[aws-iam]] | ✅ |
+| [[aws-cognito]] | ✅ — **likely the programme's hardest blocker, read it** |
+
+**Storage, networking, platform**
+
+| Note | Status |
+|---|---|
+| [[aws-s3]] | ⬜ — **lost in a cut-off wave, re-research** |
 | [[aws-efs-ebs]] | ⬜ |
 | [[aws-backup]] | ⬜ |
 | [[aws-vpc-networking]] | ✅ |
-| [[aws-iam]] | ✅ |
 | [[cross-region-connectivity]] | ⬜ |
-| [[observability-multi-region]] | 🔄 in flight |
+| [[observability-multi-region]] | ⬜ — **lost in a cut-off wave, re-research** |
+
+**AI, email, and non-AWS**
+
+| Note | Status |
+|---|---|
+| [[aws-bedrock]] | ⬜ |
+| [[aws-ses]] | ⬜ |
+| [[observability-vendors-multi-region]] | ⬜ — Datadog / Grafana / Prometheus |
+| [[third-party-saas-dependencies]] | ⬜ — the shared-fate audit |
 
 ### Strategy — `01-strategy/`
 
@@ -103,6 +150,7 @@ with [[aws-kms]] since so much leans on it.
 | [[provider-aliases-vs-separate-stacks]] | ✅ |
 | [[state-management]] | ✅ |
 | [[module-patterns]] | ✅ |
+| [[terraform-delivery-and-state-platform]] | ⬜ — can you even `apply` during a failover? |
 | [[terraform-gotchas]] | ⬜ |
 | [[repo-structure]] | ⬜ |
 
@@ -124,6 +172,10 @@ with [[aws-kms]] since so much leans on it.
 | [[data-residency]] | ⬜ — Ireland→London adequacy is live legal risk |
 | [[regulatory-drivers]] | ⬜ |
 | [[security-posture-of-the-standby]] | ⬜ |
+
+`05-cost/` and `06-compliance/` are still **empty directories**. Nothing in this
+vault currently costs the programme anything or tells it what it is legally
+allowed to do.
 | [[aws-regional-outages]] | ✅ |
 | [[lessons-and-antipatterns]] | ✅ |
 | [[07-case-studies/index]] | ⬜ |
@@ -132,9 +184,14 @@ with [[aws-kms]] since so much leans on it.
 
 Two questions the vault can't answer for you:
 
-1. **`ca-west-1` parity.** Calgary is young. [[region-pair-selection]] collects
-   the per-service findings — if it fails, the CA pair changes, and leaving
-   Canada has data-residency consequences that may be a hard blocker.
+1. **`ca-west-1` parity — the evidence is now stacking up against it.** Calgary
+   is young. [[region-pair-selection]] collects the per-service findings, and as
+   of 2026-09-20 two more services have failed the check: [[aws-cognito]]
+   (not a multi-region-replication Region, so the CA pair has *no* Cognito DR
+   path at all) and [[aws-opensearch]] (cross-cluster replication blocked by
+   opt-in-Region rules). Every wave of research makes the CA pair look worse.
+   If it fails, the pair changes — and leaving Canada has data-residency
+   consequences that may be a hard blocker rather than a cost question.
 2. **Which RTO are you held to?** 15 minutes from *incident start* and 15
    minutes from *decision to fail over* are wildly different targets.
    [[failover-orchestration]] decomposes the budget. Settle this with
