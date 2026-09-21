@@ -2,7 +2,7 @@
 title: Amazon ECR — Multi-Region
 service: ecr
 tags: [service, multi-region, ecr, containers, registry, images]
-status: partial
+status: researched
 replication: native (registry-level cross-region replication) — but not retroactive and not synchronous
 rpo_achievable: "N/A for business data. For images: 'the last image pushed more than ~30 minutes ago' — AWS publishes no SLA, only a 'majority under 30 minutes' expectation"
 rto_achievable: "< 1 min to first pull IF the image is already in the standby region's registry AND the manifest references the standby region's registry hostname. Unbounded / total failure if either is false."
@@ -262,6 +262,12 @@ not an immediate stop button.
 | Filters per rule | 100 | No | Prefix filters, so a handful. Fine. |
 | Registered repositories per region | 100,000 | Yes | Fine. |
 | Images per repository | 100,000 | Yes | Fine — but see [[#Lifecycle policies apply per region]], because without a destination lifecycle policy this is the number that eventually matters. |
+| Pull-through cache rules per registry | 50 | **No** | Four upstreams per region is comfortable. Worth knowing it is a hard ceiling if anyone proposes a PTC rule per vendor. |
+| Rules per lifecycle policy | 50 | **No** | Fine. |
+| Lifecycle policy length | 30,720 characters | **No** | Fine, but a generated policy with a long `tagPatternList` can approach it. |
+| Tags per image | 1,000 | No | Fine. |
+
+All verified against the [ECR service quotas table](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html), which states *"Each supported Region"* for every entry — there is no published per-Region variation, including for `ca-west-1`.
 
 ## The not-retroactive trap
 
@@ -768,6 +774,68 @@ pushes failed — the two regions' "10 most recent" sets are different, and the
 standby can expire a digest the primary still considers recent. The policies are
 identical; the inputs are not.
 
+**Failure 3 — `sinceImagePulled` is catastrophic in a standby, and it is the
+rule most likely to be recommended to you.** This is the sharpest finding in the
+whole lifecycle story and it is specific to active/passive.
+
+From the [lifecycle policy evaluation rules](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html):
+
+> With `countType = sinceImagePulled`, all images whose `last_recorded_pulltime`
+> is older than the specified number of days based on `countNumber` are
+> archived. If an image was never pulled, the image's `pushed_at_time` is used
+> instead of the `last_recorded_pulltime`.
+
+Now consider what "last pulled" means in a standby region. **Nothing pulls from
+the standby's registry.** The standby cluster runs zero workload pods; that is
+the definition of a pilot light. So every image in `eu-west-2` has either never
+been pulled, or was last pulled at the migration backfill. A
+`sinceImagePulled: 30 days` rule — a completely reasonable, widely-recommended
+"clean up images nobody uses" policy — will, in a standby region, eventually
+select **every image in the registry**, including the one the primary is running
+right now.
+
+The rule is not wrong. Its input signal is. "Nobody has pulled this in 30 days"
+means "this is dead" in an active region and "this is a standby doing its job"
+in a passive one. Copying the primary's lifecycle policy to the standby imports
+a heuristic whose premise is false there.
+
+> [!danger] Never use `sinceImagePulled` in a standby region
+> It is the one lifecycle rule whose failure mode is *deleting the entire DR
+> registry*, and it will look correct in review because it looks correct in the
+> primary. If a platform-wide policy template exists, it needs an explicit
+> standby carve-out. This is also a second, independent reason to run the
+> pre-pull DaemonSet from
+> [[eks-workload-delivery#The strongest option: pre-pull onto the standby's nodes]]:
+> a DaemonSet that pulls the production images in the standby keeps
+> `last_recorded_pulltime` fresh, which defuses the rule even if someone
+> re-introduces it. Defence in depth, for free.
+
+### Rule evaluation semantics worth knowing
+
+Four statements from the same page that change how you write a standby policy:
+
+- **"All rules are evaluated at the same time, regardless of rule priority. After
+  all rules are evaluated, they are then applied based on rule priority."** Lower
+  priority number wins. So a protective high-priority rule genuinely shields
+  images from a lower-priority sweeping rule.
+- **"An image is expired or archived by exactly one or zero rules."** There is no
+  compounding.
+- **"Only one rule selecting a specific storage class is allowed to select
+  untagged images."** You cannot write two untagged rules to hedge.
+- **"When reference artifacts are present in a repository, Amazon ECR lifecycle
+  policies automatically expire or archive those artifacts within 24 hours of the
+  deletion or archival of the subject image."** Signatures and SBOMs stored as
+  OCI 1.1 referrers are tied to their subject image's fate rather than being
+  swept independently — which is a real argument for referrer-based signing over
+  cosign's derived-tag layout. See [[#Image signing and attestations]].
+- **"A lifecycle policy rule may specify either `tagPatternList` or
+  `tagPrefixList`, but not both"**, and either may only be used when `tagStatus`
+  is `tagged`. `tagPatternList` supports wildcards, max four `*` per string.
+- **"If an image is referenced by a manifest list, it cannot be expired or
+  archived without the manifest list being deleted or archived first."** Useful:
+  multi-arch images are protected from having their per-platform children swept
+  out from under them.
+
 ### The fix
 
 1. **Give the standby a lifecycle policy, via a repository creation template**,
@@ -834,6 +902,21 @@ identical; the inputs are not.
   The ECR ARN is **region-qualified**, which matters if you write
   `kms:EncryptionContext:` conditions into a key policy — a condition written
   against the primary's ARN will not match in the standby.
+- **`kms:ViaService` is region-qualified too.** AWS's guidance for locking an ECR
+  key down is the `kms:ViaService` condition key with the value
+  `ecr.<region>.amazonaws.com`. Copy the primary's key policy to the standby
+  verbatim and the condition names `ecr.eu-west-1.amazonaws.com` on a key in
+  `eu-west-2` — so **every** ECR operation against it is denied, and the symptom
+  is repository creation failing, which is replication failing, silently. This is
+  the third member of the region-qualified-ARN family alongside the image
+  reference and the IAM policy; see [[aws-kms]] and [[aws-iam]].
+- **Who needs which KMS permission is split, and the split is non-obvious.**
+  `kms:RetireGrant` **must** be on the IAM policy of the principal creating the
+  repository; `kms:CreateGrant` and `kms:DescribeKey` may live on either the key
+  policy or that IAM policy. In a templated monorepo where the CI role creates
+  repositories, that means the CI role — and the creation template's
+  `custom_role_arn` — both need this, in the standby region, against the standby
+  key.
 
 ### What this means for replication
 
@@ -1262,14 +1345,39 @@ separate replication action, on its own timeline. Two consequences:
   copy --all-tags` on the repository. **A backfill that copies images but not
   signatures produces a standby that is unpullable-by-policy.**
 
-**AWS Signer / Notation (notary v2)** stores signatures using the OCI
-**referrers** API rather than derived tags. Note the PTC documentation explicitly
-mentions referrer artefacts and a 6-hour refresh window, and ECR emits an
-`ECR Referrer Action` event type — so ECR does treat referrers as
-first-class objects. **I could not find an authoritative AWS statement that
-registry replication propagates referrer artefacts.** Treat this as unverified
-and **test it** before depending on it: sign an image, let it replicate, and run
-`aws ecr list-image-referrers` (or `notation verify`) against the destination.
+**AWS Signer / Notation (notary v2)**, and cosign v3, store signatures using the
+OCI 1.1 **referrers** API rather than derived tags — the registry tracks the
+subject relationship server-side instead of requiring a derived tag.
+
+**Verified: ECR replication does propagate referrers.** The AWS Open Source Blog
+post on [OCI 1.1 support in ECR](https://aws.amazon.com/blogs/opensource/diving-into-oci-image-and-distribution-1-1-support-in-amazon-ecr/)
+states that ECR's replication feature replicates referrers to configured
+destinations on push, so image signatures, SBOMs and other referrers are present
+in any repository you replicate images to, across accounts or regions. OCI 1.1
+support is available in all commercial Regions, so this holds for all three
+pairs including `ca-west-1`.
+
+Two follow-on facts from the same post, both of which matter here:
+
+- **Lifecycle policies understand referrers.** Reference artefacts pointing at a
+  live image are protected from expiry by lifecycle rules until the subject image
+  is deleted, and are cleaned up within 24 hours of the subject's deletion. This
+  meaningfully softens [[#Lifecycle policies apply per region]] *for referrer-based
+  signing* — though not for cosign's older derived-tag layout, where the `.sig`
+  artefact is an ordinary image with no protected relationship.
+- **Referrers still replicate as their own push**, so the ordering window above
+  remains real: the image can land in the standby moments before its signature
+  does.
+
+> [!note] This resolves an open item, and it changes the recommendation
+> An earlier draft of this note recorded the referrer question as unverified.
+> It is now verified in AWS's favour. **If you are choosing a signing scheme for
+> a two-region estate, prefer a referrers-based one (Notation/AWS Signer, or
+> cosign v3 in OCI 1.1 mode) over cosign's legacy derived-tag layout** — the
+> referrer travels with replication and is protected by lifecycle policy, and
+> the `.sig` tag is neither. That is a real multi-region argument for a choice
+> usually made on other grounds. Still test it in the first drill:
+> `aws ecr list-image-referrers` against the destination, or `notation verify`.
 
 ### Recommendation
 
@@ -1284,6 +1392,989 @@ and **test it** before depending on it: sign an image, let it replicate, and run
 - Whatever you do, **do not discover the signature question during the
   failover.** Test it in the first drill.
 
+## Warm standby shape
+
+ECR is the cheapest warm standby in this vault, because the "warm" part is just
+bytes at rest. There is no capacity to pre-provision, no control plane to keep
+alive, nothing to scale to zero. What has to exist in `eu-west-2` while
+`eu-west-1` is healthy:
+
+| Thing | State while primary is healthy | Cost while idle | Provisioned at failover? |
+|---|---|---|---|
+| Registry | Exists implicitly — every account has one per Region | $0 | No, it is already there |
+| Repositories (`prod/*`) | Created by replication (or by the backfill), one per service | $0 for the repository itself | **No — must pre-exist** |
+| Images | Every digest the primary is currently running, plus the last N releases for rollback | Storage at $0.10/GB-month | **No — this is the whole point** |
+| Repository creation template | Present in the standby **before** replication is enabled | $0 | No |
+| Lifecycle policy (via the template) | Present, and more conservative than the primary's | $0 | No |
+| Repository policy (via the template) | Present, if cross-account | $0 | No |
+| KMS key + alias | Present, with the grants ECR created at repository creation | ~$1/key/month + requests | No |
+| Pull-through cache rules (Docker Hub, ECR Public, `registry.k8s.io`, Quay) | Present **and warmed** — at least one pull of every third-party image has already happened | Storage of the cached layers | **No — a cold PTC cache needs internet egress the standby may not have** |
+| Secrets Manager secret for the Docker Hub PTC credential | Present in `eu-west-2`, named `ecr-pullthroughcache/...` | ~$0.40/month | No |
+| VPC endpoints: `ecr.api`, `ecr.dkr`, S3 gateway | Present | ~$7/month/interface endpoint/AZ | No |
+| Raised service quotas | Requested and granted | $0 | **Cannot be done at failover — tickets take days** |
+| The digest-existence check (cron Lambda) | Running, reporting to the `dr_readiness` dashboard | Pennies | N/A |
+| Replication-failure EventBridge rule → SNS | Armed | $0 | N/A |
+
+**Nothing here is scaled to zero, because nothing here scales.** That is a
+genuine advantage: unlike [[aws-eks]]'s pilot light, there is no "will it scale
+in time" question for ECR. The entire risk is *correctness* — is the right
+digest present, under the right name, pullable by the right principal — and
+correctness does not improve under time pressure. Everything in the table above
+must be true continuously, and the only honest way to know it is true is the
+digest-existence check plus the pre-pull DaemonSet from
+[[eks-workload-delivery#The strongest option: pre-pull onto the standby's nodes]],
+which is simultaneously a warm cache and a continuous pull test.
+
+> [!tip] The standby's ECR is "warm" in a way the standby's nodes are not
+> Replication warms the **registry**. It does nothing for the **nodes**. At
+> failover a node coming up from zero still pulls hundreds of megabytes before
+> the first container starts. Registry-warm is necessary and not sufficient;
+> node-warm is what buys you the RTO. Both notes need reading together.
+
+> [!note] Stateful workloads pull images too
+> If [[eks-stateful-workloads]] concludes that operators (a Postgres operator, a
+> Redis operator, a CSI driver) run in the standby, their images and their
+> sidecars are part of the replication scope too — and they are the images most
+> likely to sit outside the `prod/` prefix filter, because they come from
+> Quay, `registry.k8s.io` or a vendor registry. Check the prefix filter against
+> the *actual* list of images the standby needs to start, not against the list
+> of services the company builds.
+
+## Terraform implementation
+
+### The shape, and why it is not the same shape as EKS
+
+[[aws-eks]] uses *one root module per region-pair*, two module calls, two
+provider aliases. ECR **cannot** use exactly that shape for everything, because
+its resources fall into two structurally different classes:
+
+| Class | Resources | Cardinality | Who owns it |
+|---|---|---|---|
+| **Registry-scoped singletons** | `aws_ecr_replication_configuration`, `aws_ecr_registry_policy`, `aws_ecr_registry_scanning_configuration`, `aws_ecr_repository_creation_template`, `aws_ecr_pull_through_cache_rule` | **Exactly one per account per Region** (templates and PTC rules are one per prefix, but they share one namespace) | One, and only one, root module per account+region |
+| **Per-repository** | `aws_ecr_repository`, `aws_ecr_repository_policy`, `aws_ecr_lifecycle_policy` | One per service, times two regions | The per-service module, or replication |
+
+Collapsing these into one module is the mistake. A `modules/ecr-repository`
+that teams instantiate fifty times **must not** contain a replication
+configuration: the second instance does not add a rule, it **replaces the whole
+registry configuration**, and the last `apply` silently wins. In a cookiecutter
+monorepo where each service owns a directory, this is a race condition between
+teams that `terraform plan` will not warn you about.
+
+So: **two modules, and a hard rule about which one owns what.** This is the
+"account-and-region-scoped singleton vs per-workload resource" split that
+[[module-patterns]] covers generally; ECR is the sharpest example of it in the
+estate, because the singleton silently overwrites rather than erroring.
+
+```
+terraform/
+  modules/
+    ecr-registry-settings/     # registry-scoped singletons. ONE instantiation per account+region.
+    ecr-repository/            # per-service repositories. Many instantiations.
+  live/
+    prod-eu/
+      registry/                # <- the ONLY place ecr-registry-settings is called for prod-eu
+        main.tf
+      services/
+        payments/main.tf       # <- calls ecr-repository
+        ledger/main.tf
+```
+
+### Providers
+
+Same two aliases as [[aws-eks]], so the cookiecutter template is unchanged. See
+[[provider-aliases-vs-separate-stacks]] for the general argument; ECR is a
+straightforward case for aliases because both halves are small and must move
+together.
+
+```hcl
+terraform {
+  required_version = ">= 1.5.7"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
+  }
+}
+
+provider "aws" {
+  alias  = "primary"
+  region = var.primary_region        # eu-west-1 | us-east-1 | ca-central-1
+  default_tags { tags = local.common_tags }
+}
+
+provider "aws" {
+  alias  = "standby"
+  region = var.standby_region        # eu-west-2 | us-west-2 | ca-west-1
+  default_tags { tags = local.common_tags }
+}
+```
+
+> **`ca-west-1` note:** a provider block pointed at an un-opted-in Region fails
+> at plan time with an endpoint/credential error that does not say "opt in".
+> Enable the Region in every participating account *before* the first `plan`.
+> See [[#The real `ca-west-1` finding: opt-in]].
+
+### `modules/ecr-registry-settings` — the variable surface you actually want
+
+```hcl
+# modules/ecr-registry-settings/variables.tf
+
+variable "replicate_to" {
+  description = <<-EOT
+    Destination regions for registry replication, configured in THIS region.
+    Empty list = this region is a standby and replicates nowhere.
+    A standby must never replicate back to the primary: replication does not
+    chain, but a reciprocal pair would double-store every image for no benefit.
+  EOT
+  type    = list(string)
+  default = []
+}
+
+variable "replicate_prefixes" {
+  description = <<-EOT
+    Repository prefixes to replicate. NEVER default this to "" (the whole
+    registry): most registries are majority CI scratch images and PTC caches,
+    none of which belong in a DR standby. This is the single biggest cost lever.
+  EOT
+  type    = list(string)
+  default = ["prod/"]
+  validation {
+    condition     = !contains(var.replicate_prefixes, "")
+    error_message = "Refusing to replicate the entire registry. Name the prefixes."
+  }
+}
+
+variable "destination_registry_id" {
+  description = "Account ID of the destination registry. Same account unless you run a shared-services registry."
+  type        = string
+}
+
+variable "creation_template_prefixes" {
+  description = <<-EOT
+    Prefixes for repository creation templates. Set in the STANDBY region.
+    These are what give replication-created repositories a lifecycle policy,
+    a repository policy, KMS encryption and tag-immutability settings.
+    Templates only apply at repository CREATION, so these must exist before
+    replication is enabled in the primary.
+  EOT
+  type    = list(string)
+  default = ["prod/"]
+}
+
+variable "creation_template_role_arn" {
+  description = <<-EOT
+    Required by AWS whenever a creation template sets resource_tags or KMS
+    encryption. If null and either of those is set, repository creation fails
+    -- which makes REPLICATION fail, silently.
+  EOT
+  type    = string
+  default = null
+}
+
+variable "kms_key_arn" {
+  description = "CMK in THIS region for repository encryption. null = AES256 (AWS-owned key)."
+  type        = string
+  default     = null
+}
+
+variable "standby_lifecycle" {
+  description = <<-EOT
+    Retention for the standby. Deliberately separate from the primary's, and
+    deliberately more generous. Storage is $0.10/GB-month; a missing image at
+    failover is an outage. Do NOT expire untagged images in a standby holding
+    production repositories -- untagged images are exactly what replication
+    produces, and under deploy-by-digest they are load-bearing.
+  EOT
+  type = object({
+    keep_tagged_count      = number
+    expire_untagged_days   = optional(number)   # leave null for prod prefixes
+  })
+  default = {
+    keep_tagged_count    = 30
+    expire_untagged_days = null
+  }
+}
+
+variable "pull_through_cache" {
+  description = "Upstream registries to cache locally. Configure identically in BOTH regions."
+  type = map(object({
+    upstream_registry_url = string
+    credential_arn        = optional(string)   # Secrets Manager secret, SAME region, name must start ecr-pullthroughcache/
+  }))
+  default = {}
+}
+
+variable "cross_account_puller_arns" {
+  description = <<-EOT
+    Account/role ARNs allowed to pull from repositories created by the template.
+    Only needed if the standby cluster lives in a different account from the
+    registry. Repository policies are NOT replicated, so without this a
+    cross-account standby cannot pull a perfectly-present image.
+  EOT
+  type    = list(string)
+  default = null
+}
+
+variable "role" {
+  description = "primary | standby. Drives replication direction and retention generosity only."
+  type        = string
+  validation {
+    condition     = contains(["primary", "standby"], var.role)
+    error_message = "role must be primary or standby."
+  }
+}
+```
+
+### `modules/ecr-registry-settings/main.tf`
+
+```hcl
+# ---------------------------------------------------------------------------
+# REPLICATION -- configured in the SOURCE region only.
+# Registry-scoped singleton: exactly one of these may exist per account+region.
+# A second declaration does not merge, it replaces. Guard it with the
+# count below so a standby instantiation is a no-op rather than a fight.
+# ---------------------------------------------------------------------------
+resource "aws_ecr_replication_configuration" "this" {
+  count = length(var.replicate_to) > 0 ? 1 : 0
+
+  replication_configuration {
+    rule {
+      dynamic "destination" {
+        for_each = var.replicate_to
+        content {
+          region      = destination.value
+          registry_id = var.destination_registry_id
+        }
+      }
+
+      dynamic "repository_filter" {
+        for_each = var.replicate_prefixes
+        content {
+          filter      = repository_filter.value
+          filter_type = "PREFIX_MATCH"   # the only value the API accepts
+        }
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# REPOSITORY CREATION TEMPLATES -- configured in the DESTINATION region.
+# This is the ONLY mechanism that gives a replication-created repository a
+# lifecycle policy, a repository policy, KMS encryption, or immutable tags.
+# It applies at repository CREATION only: adding it later does nothing to
+# repositories replication has already created.
+# ---------------------------------------------------------------------------
+resource "aws_ecr_repository_creation_template" "this" {
+  for_each = var.role == "standby" ? toset(var.creation_template_prefixes) : toset([])
+
+  prefix          = each.value          # ForceNew. "ROOT" matches anything unmatched.
+  description     = "DR standby settings for ${each.value}* (managed by Terraform)"
+  applied_for     = ["REPLICATION"]     # add CREATE_ON_PUSH if CI also pushes here
+  custom_role_arn = var.creation_template_role_arn
+
+  # IMMUTABLE_WITH_EXCLUSION lets a convenience tag float for humans while
+  # everything else is immutable. Requires provider >= 6.x.
+  image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
+  image_tag_mutability_exclusion_filter {
+    filter      = "latest"
+    filter_type = "WILDCARD"
+  }
+
+  encryption_configuration {
+    encryption_type = var.kms_key_arn == null ? "AES256" : "KMS"
+    kms_key         = var.kms_key_arn
+  }
+
+  repository_policy = var.cross_account_puller_arns == null ? null : data.aws_iam_policy_document.standby_pull[0].json
+
+  lifecycle_policy = jsonencode({
+    rules = concat(
+      [{
+        rulePriority = 1
+        description  = "Keep ${var.standby_lifecycle.keep_tagged_count} most recent releases (more generous than the primary)"
+        selection = {
+          tagStatus     = "tagged"
+          tagPatternList = ["v*"]
+          countType     = "imageCountMoreThan"
+          countNumber   = var.standby_lifecycle.keep_tagged_count
+        }
+        action = { type = "expire" }
+      }],
+      # Deliberately conditional and deliberately off by default. See the
+      # lifecycle section: an untagged-expiry rule in the standby deletes
+      # exactly the artefacts replication creates.
+      var.standby_lifecycle.expire_untagged_days == null ? [] : [{
+        rulePriority = 2
+        description  = "Expire untagged after ${var.standby_lifecycle.expire_untagged_days} days"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = var.standby_lifecycle.expire_untagged_days
+        }
+        action = { type = "expire" }
+      }]
+    )
+  })
+}
+
+# ---------------------------------------------------------------------------
+# PULL-THROUGH CACHE -- identical in BOTH regions. This is what stops a
+# failover depending on Docker Hub's rate limiter.
+# ---------------------------------------------------------------------------
+resource "aws_ecr_pull_through_cache_rule" "this" {
+  for_each = var.pull_through_cache
+
+  ecr_repository_prefix = each.key                              # ForceNew
+  upstream_registry_url = each.value.upstream_registry_url      # ForceNew
+  credential_arn        = try(each.value.credential_arn, null)  # Secrets Manager, same region
+}
+
+# ---------------------------------------------------------------------------
+# SCANNING -- registry-scoped. Set it in BOTH regions or the standby's images
+# are unscanned, which is a compliance finding waiting to be written up.
+# Note: destroying this resource does not remove it, it reverts to BASIC.
+# ---------------------------------------------------------------------------
+resource "aws_ecr_registry_scanning_configuration" "this" {
+  scan_type = "ENHANCED"
+  rule {
+    scan_frequency = var.role == "primary" ? "CONTINUOUS_SCAN" : "SCAN_ON_PUSH"
+    repository_filter {
+      filter      = "*"
+      filter_type = "WILDCARD"
+    }
+  }
+}
+```
+
+> [!note] Enhanced scanning in the standby is a real cost decision, not a rounding error
+> `CONTINUOUS_SCAN` re-scans on new CVE intelligence and is billed per image
+> per month. Applying it to a standby registry that holds a duplicate of every
+> production image doubles that line. `SCAN_ON_PUSH` in the standby is the
+> defensible middle: replicated images are scanned once on arrival, and the
+> continuous intelligence comes from the primary's copy of the same digest.
+> Verify current enhanced-scanning pricing on the
+> [ECR pricing page](https://aws.amazon.com/ecr/pricing/) before choosing —
+> **I have not verified the per-image figure** and it moves.
+
+### `modules/ecr-repository` — the per-service module
+
+The important design decision: **does this module create the standby's
+repository, or does replication?** Both work and they trade differently.
+
+| | Replication auto-creates | Terraform creates in both regions |
+|---|---|---|
+| Destination repository settings | Whatever the creation template says, or defaults | Exactly what you wrote |
+| If the template was added late | Destination repos keep default settings forever | N/A — Terraform converges |
+| Drift detection | None. Terraform does not know the repository exists | `terraform plan` shows it |
+| Repository exists before the first push | **No** — a backfill with `crane` must create it | **Yes** — backfill just works |
+| Extra Terraform surface | None | Doubles the repository resource count |
+| Failure mode | Silent (a `FAILED` replication nobody reads) | Loud (`plan` fails) |
+
+**Recommendation: Terraform creates both, and the creation template exists
+anyway as a backstop.** The template alone relies on ordering that nothing
+enforces and on a `FAILED` status nobody polls; declaring both repositories
+makes the standby's registry visible to `terraform plan`, which is the only
+drift detector this layer has. The cost is a doubled resource count in a module
+that is three resources long. Take it.
+
+```hcl
+# modules/ecr-repository/main.tf
+#
+# Called once per service. Creates the repository in BOTH regions.
+# Does NOT contain a replication configuration -- that is registry-scoped and
+# belongs to ecr-registry-settings. If you put one here, the fiftieth
+# instantiation silently overwrites the other forty-nine.
+
+terraform {
+  required_providers {
+    aws = {
+      source                = "hashicorp/aws"
+      version               = "~> 6.0"
+      configuration_aliases = [aws.primary, aws.standby]
+    }
+  }
+}
+
+variable "name"               { type = string }                  # e.g. "prod/payments"
+variable "primary_kms_key_arn" { type = string, default = null }
+variable "standby_kms_key_arn" { type = string, default = null }
+variable "keep_tagged_primary" { type = number, default = 10 }
+variable "keep_tagged_standby" { type = number, default = 30 }   # deliberately larger
+
+locals {
+  regions = {
+    primary = { provider_key = "primary", kms = var.primary_kms_key_arn, keep = var.keep_tagged_primary }
+    standby = { provider_key = "standby", kms = var.standby_kms_key_arn, keep = var.keep_tagged_standby }
+  }
+}
+
+resource "aws_ecr_repository" "primary" {
+  provider             = aws.primary
+  name                 = var.name                    # ForceNew
+  image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"  # NOT ForceNew -- safe to change on a live repo
+  image_tag_mutability_exclusion_filter {
+    filter      = "latest"
+    filter_type = "WILDCARD"
+  }
+  image_scanning_configuration { scan_on_push = true }
+
+  # ForceNew, and immutable in the API too. Getting this wrong means deleting
+  # and recreating the repository -- i.e. deleting every image in it.
+  encryption_configuration {
+    encryption_type = var.primary_kms_key_arn == null ? "AES256" : "KMS"
+    kms_key         = var.primary_kms_key_arn
+  }
+}
+
+resource "aws_ecr_repository" "standby" {
+  provider             = aws.standby
+  name                 = var.name                    # SAME NAME. Replication cannot rename.
+  image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
+  image_tag_mutability_exclusion_filter {
+    filter      = "latest"
+    filter_type = "WILDCARD"
+  }
+  image_scanning_configuration { scan_on_push = true }
+
+  encryption_configuration {
+    encryption_type = var.standby_kms_key_arn == null ? "AES256" : "KMS"
+    kms_key         = var.standby_kms_key_arn        # a key in eu-west-2, NOT the primary's
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "primary" {
+  provider   = aws.primary
+  repository = aws_ecr_repository.primary.name
+  policy = jsonencode({ rules = [{
+    rulePriority = 1
+    description  = "Keep ${var.keep_tagged_primary} releases"
+    selection    = { tagStatus = "tagged", tagPatternList = ["v*"], countType = "imageCountMoreThan", countNumber = var.keep_tagged_primary }
+    action       = { type = "expire" }
+  }] })
+}
+
+resource "aws_ecr_lifecycle_policy" "standby" {
+  provider   = aws.standby
+  repository = aws_ecr_repository.standby.name
+  policy = jsonencode({ rules = [{
+    rulePriority = 1
+    description  = "Keep ${var.keep_tagged_standby} releases -- MORE than the primary, on purpose"
+    selection    = { tagStatus = "tagged", tagPatternList = ["v*"], countType = "imageCountMoreThan", countNumber = var.keep_tagged_standby }
+    action       = { type = "expire" }
+  }] })
+  # Note the absence of an untagged rule. That absence is the design.
+}
+
+output "primary_url" { value = aws_ecr_repository.primary.repository_url }
+output "standby_url" { value = aws_ecr_repository.standby.repository_url }
+```
+
+The two `repository_url` outputs are what the deploy pipeline and the Kustomize
+overlays consume — **never a hand-written hostname**. If the only place a
+registry hostname is typed is a Terraform output, the grep in
+[[#2. The manifest names the `eu-west-2` registry]] comes back clean by
+construction.
+
+### The root module for a pair
+
+```hcl
+# live/prod-eu/registry/main.tf
+
+module "registry_primary" {
+  source    = "../../../modules/ecr-registry-settings"
+  providers = { aws = aws.primary }
+
+  # Ordering is not optional. The standby's repository creation templates must
+  # exist BEFORE the primary starts replicating, or the first wave of
+  # destination repositories is born with default settings (MUTABLE, AES256,
+  # no lifecycle policy, no repository policy) that the template will never
+  # revisit -- templates apply at creation only.
+  depends_on = [module.registry_standby]
+
+  role                    = "primary"
+  replicate_to            = [var.standby_region]
+  replicate_prefixes      = ["prod/"]
+  destination_registry_id = data.aws_caller_identity.current.account_id
+  kms_key_arn             = aws_kms_key.ecr_primary.arn
+
+  pull_through_cache = {
+    "docker-hub" = { upstream_registry_url = "registry-1.docker.io", credential_arn = aws_secretsmanager_secret.dockerhub_primary.arn }
+    "ecr-public" = { upstream_registry_url = "public.ecr.aws" }
+    "k8s"        = { upstream_registry_url = "registry.k8s.io" }
+    "quay"       = { upstream_registry_url = "quay.io" }
+  }
+}
+
+module "registry_standby" {
+  source    = "../../../modules/ecr-registry-settings"
+  providers = { aws = aws.standby }
+
+  role                       = "standby"
+  replicate_to               = []                 # standby replicates nowhere
+  creation_template_prefixes = ["prod/"]
+  creation_template_role_arn = aws_iam_role.ecr_template_standby.arn
+  destination_registry_id    = data.aws_caller_identity.current.account_id
+  kms_key_arn                = aws_kms_key.ecr_standby.arn
+
+  # Identical PTC rules, with a SEPARATE secret in eu-west-2 -- the credential
+  # secret must live in the same account AND region as the rule.
+  pull_through_cache = {
+    "docker-hub" = { upstream_registry_url = "registry-1.docker.io", credential_arn = aws_secretsmanager_secret.dockerhub_standby.arn }
+    "ecr-public" = { upstream_registry_url = "public.ecr.aws" }
+    "k8s"        = { upstream_registry_url = "registry.k8s.io" }
+    "quay"       = { upstream_registry_url = "quay.io" }
+  }
+}
+```
+
+> [!warning] `depends_on` between module calls is the only thing enforcing the ordering
+> Nothing in the ECR API enforces "templates before replication". Nothing in
+> `terraform plan` warns. If the two modules land in separate `apply`s — which
+> they will if someone splits the root — the ordering is a human
+> responsibility. Put it in the migration checklist as well as the code.
+
+### The custom role for the creation template
+
+Required as soon as the template sets KMS encryption or resource tags, and the
+failure mode if it is missing or under-permissioned is *replication failing
+silently*.
+
+```hcl
+resource "aws_iam_role" "ecr_template_standby" {
+  provider = aws.standby
+  name     = "ecr-repository-creation-template"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "replication.ecr.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "ecr_template_standby" {
+  provider = aws.standby
+  role     = aws_iam_role.ecr_template_standby.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:CreateRepository",
+          "ecr:PutLifecyclePolicy",
+          "ecr:SetRepositoryPolicy",
+          "ecr:TagResource",
+          "ecr:PutImageTagMutability",
+        ]
+        Resource = "arn:aws:ecr:${var.standby_region}:${data.aws_caller_identity.current.account_id}:repository/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:CreateGrant", "kms:DescribeKey", "kms:RetireGrant"]
+        Resource = aws_kms_key.ecr_standby.arn
+      },
+    ]
+  })
+}
+```
+
+> **Verify the trust principal before you rely on this.** The service principal
+> ECR uses to assume a repository-creation-template role is not something I
+> could confirm from a primary AWS source with certainty, and it differs between
+> the replication, create-on-push and pull-through-cache paths. Create the role,
+> trigger one replication, and read CloudTrail's `AssumeRole` event to get the
+> exact principal — then pin it. Do not ship this block unverified.
+
+### ForceNew and replacement risk
+
+The question every migration note in this vault has to answer: what in here can
+destroy a live resource? Checked against the provider **source**, not only the
+docs:
+
+| Resource / argument | ForceNew? | What replacement costs you |
+|---|---|---|
+| `aws_ecr_repository.name` | **Yes** | Deleting the repository deletes **every image in it**. Renaming a repository is a data-loss operation dressed as a rename. |
+| `aws_ecr_repository.encryption_configuration` (and `encryption_type`, `kms_key`) | **Yes** | Same — total image loss. And the API agrees: encryption configuration cannot be changed after creation. **Switching an existing repository from AES256 to a CMK is not possible in place.** |
+| `aws_ecr_repository.image_tag_mutability` | **No** | Updated in place via `PutImageTagMutability`. Safe to flip `MUTABLE` → `IMMUTABLE_WITH_EXCLUSION` on a live repository. |
+| `aws_ecr_repository.image_tag_mutability_exclusion_filter` | **No** | Same call, same safety. |
+| `aws_ecr_repository.image_scanning_configuration` | **No** | `PutImageScanningConfiguration`, in place. |
+| `aws_ecr_repository_creation_template.prefix` | **Yes** | Cheap — the template is metadata. Replacing it does not touch repositories. But note that repositories created under the old template keep their settings. |
+| `aws_ecr_pull_through_cache_rule.ecr_repository_prefix`, `.upstream_registry_url`, `.upstream_repository_prefix` | **Yes** | Cheap-ish. Replacing the rule does not delete the cached repositories, but it does reset the cache relationship. |
+| `aws_ecr_replication_configuration` | N/A (singleton) | Destroying it stops replication. It does **not** delete anything already replicated. |
+| `aws_ecr_registry_scanning_configuration` | N/A (singleton) | Destroying it reverts the registry to `BASIC`, it does not remove the resource. |
+
+**The two that matter, loudly:**
+
+1. **`encryption_configuration` is ForceNew and API-immutable.** If the estate
+   currently runs AES256 repositories and a control requires CMKs, the only
+   path is: create a new repository, copy the images across with `crane`,
+   repoint the deploy pipeline, delete the old one. There is no in-place
+   migration. **Decide the encryption posture before you create the standby's
+   repositories, because fixing it later is the same amount of work as the
+   original migration.** See [[aws-kms]].
+2. **`name` is ForceNew, and replication cannot rename.** If the current
+   repositories are named per-region (`prod-eu-west-1/payments`), replication
+   will faithfully create `prod-eu-west-1/payments` in London — a repository
+   whose name is a lie. Fixing that is a rename, which is a
+   delete-and-recreate, which is image loss. The safe sequence is *create the
+   new name alongside, copy, cut the pipeline over, delete the old* — exactly
+   the shape of [[dynamodb-table-naming-migration]], and worth reading that
+   note for the pattern even though the service is different.
+
+**Everything else is additive.** The standby's repositories, the templates, the
+replication configuration, the PTC rules and the KMS keys are all new
+resources in a new Region. `terraform plan` on the primary should show
+**zero changes** to existing repositories apart from the in-place
+`image_tag_mutability` flip. If it shows a replacement, stop.
+
+## Migration path from single-region
+
+Ordering is the whole difficulty. Several steps are irreversible-ish and two of
+them must happen before replication is enabled or they never take effect.
+
+1. **Answer the naming question first.** Are repositories named per-region or
+   per-environment today? If per-region, the rename is the long pole and
+   everything else waits on it, because replication preserves names and a
+   renamed repository is a recreated repository. Do this as its own project.
+2. **Answer the account question.** Is the standby in the same account? It
+   changes whether you need a destination registry policy and cross-account
+   repository policies at all. This is [[aws-eks]]'s open question 2 and it
+   needs one answer for the whole estate.
+3. **`ca-west-1` only: opt in, in every account**, and confirm with
+   `aws account get-region-opt-status --region-name ca-west-1`. Multi-day lead
+   time, invisible in `terraform plan`, and a hard prerequisite for replication
+   into Calgary.
+4. **Decide the encryption posture** (AES256 vs CMK) and create the standby KMS
+   key if CMK. ForceNew, so this cannot be revisited cheaply.
+5. **Create the repository creation template(s) in the standby**, with the
+   custom role, and verify the role's trust principal from a CloudTrail
+   `AssumeRole` event. **Before step 7.**
+6. **Create the standby repositories in Terraform** with the same names as the
+   primary. Additive, zero production impact. Doing this explicitly rather than
+   leaving it to replication means the backfill in step 8 has somewhere to
+   land and `terraform plan` can see drift.
+7. **Enable replication in the primary**, with a prefix filter. From this
+   moment every new push fans out. Watch `DescribeImageReplicationStatus` on
+   the next deploy to confirm it works before trusting it.
+8. **Backfill with `crane`/`regctl`** — the currently-deployed digest per
+   service plus the last N releases. Run it from an instance in the **source**
+   region, with concurrency 8–16 to stay under the 10/sec `PutImage` quota.
+   See [[#Option C — Registry-to-registry copy with `crane` / `skopeo` / `regctl` (recommended)]].
+9. **Verify the backfill by digest**, not by eyeball — the
+   `kubectl`-to-`describe-images` check. Any output at all is a blocker.
+10. **Flip `image_tag_mutability` to `IMMUTABLE_WITH_EXCLUSION`** in both
+    regions. In-place, not ForceNew. Expect the first few pipeline failures
+    from someone re-pushing a tag; that is the control working.
+11. **Change the deploy pipeline to resolve and deploy by digest**, and to
+    template the registry hostname per cluster. See
+    [[#What the CI pipeline must change to]]. **This is the step that actually
+    fixes the spine problem**; everything before it only moved bytes.
+12. **Create PTC rules in both regions and warm the standby's cache** by
+    pulling every third-party image through it once, from somewhere with
+    internet egress. One-time, impossible during an incident.
+13. **Arm the alarms**: EventBridge rule on `ECR Replication Action` with
+    `result != SUCCESS` → SNS; Service Quotas alarms at 70% on the four pull-path
+    quotas; the digest-existence cron on the `dr_readiness` dashboard.
+14. **Raise the standby's ECR quotas** as part of the standby quota audit. Free,
+    slow, and not filable during an incident.
+15. **Deploy the pre-pull DaemonSet** in the standby so images land on nodes,
+    not just in the registry — and so you have a continuous pull test.
+16. **Drill.** Scale the standby, confirm every pod pulls, time it.
+
+> [!warning] Steps 5 and 7 are ordered and nothing enforces it
+> Template first, replication second. Reverse them and you get a set of
+> destination repositories with `MUTABLE` tags, `AES256` encryption, no
+> lifecycle policy and no repository policy — and a template that will never
+> touch them, because templates only apply at creation. The only remedy is to
+> delete those repositories and let replication recreate them, which means
+> re-running the backfill.
+
+## What the CI pipeline must change to
+
+This is the section that turns the note into work. Four changes, in dependency
+order.
+
+### Change 1 — Resolve the digest at build time and carry it forward
+
+```bash
+# One push. Capture the digest the registry actually assigned.
+docker buildx build --push \
+  -t "$ACCOUNT.dkr.ecr.$PRIMARY.amazonaws.com/prod/payments:$VERSION" \
+  --platform linux/amd64,linux/arm64 .
+
+DIGEST=$(aws ecr describe-images --region "$PRIMARY" \
+  --repository-name prod/payments --image-ids imageTag="$VERSION" \
+  --query 'imageDetails[0].imageDigest' --output text)
+```
+
+Everything downstream references `$DIGEST`, never `$VERSION`. The tag survives
+for humans reading `describe-images` at 3am.
+
+### Change 2 — Gate the standby deploy on replication completion
+
+The race in [[#The race]] is closed by polling
+`DescribeImageReplicationStatus` before syncing the standby, and/or by driving
+the standby's sync from the destination-region `ECR Replication Action` event.
+Both, ideally: event as the fast path, poll as the authoritative backstop.
+
+### Change 3 — Template the registry hostname per cluster
+
+The manifest carries a digest and a *placeholder* registry. The per-region
+overlay supplies the hostname, sourced from the Terraform output, never typed.
+
+```yaml
+# overlays/eu-west-2/kustomization.yaml
+images:
+  - name: payments
+    newName: 123456789012.dkr.ecr.eu-west-2.amazonaws.com/prod/payments
+    digest: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+```
+
+### Change 4 — Rewrite third-party image references to the PTC prefix
+
+`docker.io/library/redis:7` becomes
+`<acct>.dkr.ecr.<region>.amazonaws.com/docker-hub/library/redis:7`, per region.
+This is what removes Docker Hub from the failover path.
+
+### The fork: push to both registries, or push once and let replication fan out?
+
+A genuine decision, and the brief asks for both branches.
+
+| | **A — Push once, replication fans out** | **B — CI pushes to both registries** |
+|---|---|---|
+| Who copies the bytes | ECR, asynchronously | Your pipeline, synchronously |
+| Timing guarantee | None. "Majority under 30 minutes." | Deterministic — the push either succeeded or the build failed |
+| Digest preserved | Yes | Yes, **if** you `crane copy` rather than rebuild. A second `docker build` produces a different digest and is wrong. |
+| Cost | ECR data transfer out from the source region | Same bytes, same direction, same charge — plus CI minutes |
+| Pipeline complexity | Low. Plus a polling gate. | Higher. Two registry logins, two failure paths, retry logic. |
+| Failure mode | Silent (`FAILED` status nobody reads) unless you alarm on it | Loud — the build goes red |
+| Covers pre-existing images | No — the backfill is separate | No — the backfill is still separate |
+| Covers images pushed by *anything other than CI* | **Yes** — a human `docker push`, a vendored image, a restore | **No** — anything bypassing the pipeline is not mirrored |
+| Works when the standby region is degraded | Yes — replication retries | **No** — a `eu-west-2` blip fails your `eu-west-1` deploy. You have coupled the primary's release train to the standby's health. |
+| Cross-account story | Destination registry policy, done once | Cross-account push credentials in CI, rotated |
+
+**Recommendation: A — push once, let replication fan out, and gate the standby's
+deploy on `DescribeImageReplicationStatus`.** Three reasons, in order:
+
+1. **B couples the primary's ability to ship to the standby's health.** A
+   region you are not serving from should never be able to block a release.
+   That is a worse property than the replication lag it fixes.
+2. **A catches everything, not just CI.** Registry replication is a property of
+   the registry; it mirrors a human's emergency `docker push` at 2am just as
+   faithfully as a pipeline's. B mirrors only what the pipeline does, and the
+   images that end up missing at failover are precisely the ones that did not
+   come from the pipeline.
+3. **The thing B is supposed to fix — the race — is already fixable in A** for
+   about ten lines of polling. You do not need to change where the bytes come
+   from to fix *when* you deploy them.
+
+**Take B only if** you have measured your own replication latency and found it
+unacceptable (measure it first — see
+[[#Detecting replication completion]]), or if a compliance control requires a
+synchronous, auditable copy with a recorded outcome per release. If you do take
+B, **copy with `crane`, never rebuild**, and keep replication enabled anyway as
+the net for out-of-band pushes. A and B are not mutually exclusive; B plus A is
+belt and braces, B instead of A is a gap.
+
+## Failover procedure
+
+ECR is the rare service with **no failover steps**, and that is the point.
+
+It contributes **no steps** to the runbook in [[failover-orchestration]], which
+is the correct outcome and worth stating explicitly there so nobody adds one.
+
+1. **Nothing.** If the migration was done, the images are in `eu-west-2`, the
+   standby's manifests already name `eu-west-2`'s registry, the node role's IAM
+   policy already covers the `eu-west-2` repository ARNs, and the PTC cache is
+   warm. The registry does not need promoting, flipping, or scaling.
+2. **Confirm, do not assume.** The one action worth taking in the first five
+   minutes, because it is read-only and fast:
+   ```bash
+   # Does the standby have every digest the primary was running?
+   # Run against the last known-good pod inventory, captured by the cron job.
+   aws ecr describe-images --region eu-west-2 \
+     --repository-name prod/payments --image-ids imageDigest="$DIGEST"
+   ```
+   If the cron check has been green, skip even this.
+3. **Stop replication into the dead region — later, not now.** Once
+   `eu-west-2` becomes the region being deployed to, the replication
+   configuration in `eu-west-1` is pointing the wrong way. It is harmless while
+   `eu-west-1` is down (nothing is being pushed there) and it becomes a
+   *failback* concern. Do not touch it during the incident.
+4. **Watch for `ImagePullBackOff` specifically.** It is the symptom of every
+   failure this note describes, and it is distinguishable from an application
+   failure in one `kubectl get events`. If you see it, the diagnosis tree is:
+   wrong registry hostname → missing digest → missing IAM/repository policy →
+   missing VPC endpoint → Docker Hub 429. In that order, because that is the
+   order of likelihood.
+
+**Time budget: zero minutes.** ECR consumes none of the 15-minute RTO if the
+work was done, and **unbounded** time if it was not — there is no fast remedy
+for a missing image at 3am. That asymmetry is why this note is long.
+
+## Failback
+
+Failback is where the registry stops being free, because the direction of
+replication is now wrong and the two registries have diverged.
+
+**What happened during the outage:** you deployed to `eu-west-2` — hotfixes,
+rollbacks, whatever the incident needed. Those images were pushed to
+`eu-west-2`'s registry. `eu-west-1`'s registry **does not have them**, because
+replication is one-directional and does not chain, and because `eu-west-1` was
+down anyway.
+
+Steps, in order:
+
+1. **Do not fail back under pressure.** Same rule as [[aws-eks#Failback]]. Once
+   the standby is serving, the incident is over. Failback is a weekday-morning
+   planned change.
+2. **Inventory the divergence.** Which digests does `eu-west-2` have that
+   `eu-west-1` does not? The same `comm`-based diff from
+   [[#Recommendation]], run in the opposite direction. This is a mechanical,
+   scriptable answer and it should be the first thing you produce.
+3. **Copy the gap back with `crane`**, from `eu-west-2` to `eu-west-1`. This is
+   a second backfill and it has all the same properties: preserves digests,
+   preserves multi-arch, respects the `PutImage` 10/sec quota, costs
+   source-region data transfer out (now billed against `eu-west-2`).
+4. **Reverse — or do not reverse — the replication configuration.** Two
+   branches:
+   - **Actually fail back.** Delete the `eu-west-2` → `eu-west-1` replication
+     config once `eu-west-1` is primary again, and re-enable
+     `eu-west-1` → `eu-west-2`. Note the not-retroactive trap applies *again*
+     in the new direction: anything pushed to `eu-west-2` during the outage is
+     pre-existing content from the new rule's point of view and will never
+     replicate. That is what step 3 is for, and it is why step 3 comes first.
+   - **Promote the standby permanently.** `eu-west-2` becomes the primary,
+     `eu-west-1` becomes the standby, and you flip the `role` variable in the
+     root module. Given the modules above are symmetric, this is a variable
+     change, not a rewrite — which is a deliberate design property and the
+     strongest argument for the `role`-driven module shape. **For ECR
+     specifically, this is usually the better answer**, because it avoids a
+     second backfill in the other direction and you have just proved the new
+     primary works.
+5. **Re-warm the old primary's PTC cache** if it expired. The 24-hour
+   revalidation window means a long outage leaves stale cache state; the first
+   pull after failback may need internet egress.
+6. **Re-check lifecycle policies.** While `eu-west-1` was down its lifecycle
+   rules kept running — ECR does not pause them for a Region you are not using.
+   If `eu-west-1` had the aggressive "keep 10" policy and you were away for
+   three weeks, it may have expired the digests you are about to fail back onto.
+   **Run `start-lifecycle-policy-preview` against the old primary before you
+   send traffic to it.**
+
+> [!caution] The failback trap, in one sentence
+> The old primary's lifecycle policy keeps deleting images while you are not
+> looking, and replication will not put them back, because replication is not
+> retroactive and does not run backwards.
+
+## Gotchas
+
+The consolidated list. Several are restatements — they are here because this is
+the section people actually read. Items 1, 2, 4 and 6a are the ones worth
+promoting into [[lessons-and-antipatterns]]: each is a case where the control
+plane reports success, the console shows green, and the standby is broken.
+
+1. **The image reference in the standby's manifest names the primary's
+   registry.** Silent while the primary is healthy, total at failover. The
+   single highest-value finding in this note. Grep for
+   `\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com` everywhere, including Terraform,
+   Dockerfile `FROM` lines and Lambda image URIs.
+2. **Replication is not retroactive.** Enabling it populates nothing. There is
+   no ECR equivalent of S3 Batch Replication. Backfill with `crane`.
+3. **Replication is async with no SLA.** "Majority under 30 minutes" is the
+   entire published guarantee, and the ECR SLA (99.9% monthly uptime, per
+   Region) covers API availability, not replication latency. A pipeline that
+   pushes then immediately deploys to both regions races it and the standby
+   loses.
+4. **`:latest`, or any mutable tag, means the two registries can disagree about
+   what you are running.** Failover then lands on an untested build. Deploy by
+   digest.
+5. **Immutable tags plus a re-pushed tag produce an *untagged* image in the
+   destination**, not a rejected push. An untagged image is not pullable by tag,
+   and it is exactly what a `tagStatus: untagged` lifecycle rule deletes.
+6. **Lifecycle policies run independently per Region and are not replicated.**
+   Either the standby has none and grows forever, or it has the primary's and
+   can delete a digest the primary still runs. Make the standby's strictly more
+   conservative, and never expire untagged images there.
+6a. **`countType: sinceImagePulled` in a standby will eventually select every
+    image in the registry**, because nothing ever pulls from a passive region and
+    AWS falls back to `pushed_at_time` for images never pulled. The most
+    reasonable-looking cleanup rule in the catalogue is the most destructive one
+    here. Never use it in a standby.
+7. **Repository creation templates only apply at repository creation.** Add one
+   after replication has already created the destination repositories and it
+   does nothing to them, forever. Templates before replication.
+8. **A creation template that specifies KMS or resource tags without a valid
+   `custom_role_arn` fails repository creation, which fails replication,
+   silently.** The only evidence is a `FAILED` status nobody is polling.
+9. **`encryption_configuration` is ForceNew and API-immutable.** AES256 → CMK on
+   an existing repository is not a change, it is a migration.
+10. **`name` is ForceNew and replication cannot rename.** Per-region repository
+    names replicate as per-region repository names. Fix the naming first.
+11. **Repository policies are not replicated.** In a cross-account estate the
+    standby's nodes cannot pull a perfectly-present image. The creation template
+    is the only sane fix, subject to gotcha 7.
+12. **IAM policy ARNs are region-qualified.** `arn:aws:ecr:eu-west-1:...` in a
+    node role grants nothing in `eu-west-2`. IAM is global; the ARNs inside it
+    are not. Same shape as gotcha 1, different file.
+13. **The S3 gateway endpoint is the third ECR endpoint people forget.** Layer
+    blobs are served from S3. Symptom: auth succeeds, pull hangs.
+14. **Docker Hub's unauthenticated limit is 100 pulls per 6 hours per IP, and
+    every node behind one NAT gateway is one IP.** Thirty cold nodes at failover
+    will blow it. PTC rules in both regions, authenticated, with references
+    rewritten.
+15. **A cold PTC cache needs internet egress.** A fully private standby VPC
+    cannot populate one. Warm it while the primary is healthy.
+16. **ECR-to-ECR pull-through cache pointed at the primary is an anti-pattern
+    for DR.** Its upstream is the region you are failing away from.
+17. **Deletes do not replicate.** A bad image deleted from the primary lives on
+    in the standby. Over years the registries drift in both directions.
+18. **Archive behaviour is asymmetric.** Per the replication docs, an image
+    archived in the source is *not* archived in the destination, and an image
+    replicated to a destination where it is archived gets *restored* there.
+    Worth knowing if ECR's archival tiering is ever enabled — the standby's
+    storage profile will not match the primary's.
+19. **`PutImage` is 10/sec and it is the tightest quota in the table.** It does
+    not matter at failover (pull path) and it very much matters during a
+    parallel backfill. Concurrency 8–16.
+20. **The replication configuration is a registry-scoped singleton.** Two
+    Terraform declarations in one account+region do not merge; the last `apply`
+    silently wins. Keep it out of the per-service module.
+21. **The Terraform provider documents a maximum of 10 rules per replication
+    configuration while AWS documents 25.** Not a problem at this estate's scale
+    (one rule per pair), but do not design around 25 without testing it.
+22. **Enhanced scanning with `CONTINUOUS_SCAN` in the standby doubles the
+    scanning bill** on a registry holding a duplicate of every production image.
+23. **Lambda cannot pull through a PTC rule.** Container-image Lambdas need real
+    repositories in both regions. See [[aws-lambda]].
+24. **Signatures replicate, but on their own timeline.** There is a window where
+    the image is in the standby and its signature is not. An `enforce`-mode
+    admission policy rejects the pod. Test this in the first drill.
+25. **A `crane copy` of a single tag does not carry cosign's `.sig` tag.** Use
+    `regctl image copy --digest-tags`, `cosign copy`, or `crane copy --all-tags`.
+26. **`ca-west-1` is opt-in, and replication requires *both* accounts opted in.**
+    Multi-day lead time across an organisation, invisible in `terraform plan`.
+
+## Decisions to make
+
+| Decision | Option A | Option B | Recommendation |
+|---|---|---|---|
+| How images reach the standby | Registry replication, push once | CI pushes to both registries | **A**, with a `DescribeImageReplicationStatus` gate before the standby deploy. B couples the primary's release train to the standby's health, and misses anything not pushed by CI. Add B on top only if you measure replication latency and dislike it. |
+| Backfilling existing images | Re-push from CI | `crane`/`regctl` registry-to-registry copy | **B.** Re-pushing rebuilds, a rebuild changes the digest, and you have replicated an image that is not the one in production. Restrict the copy to the live digest plus the last N releases. |
+| What the Deployment references | Immutable tag (`v1.43.0`) | Digest (`@sha256:…`) | **B.** A digest cannot resolve differently in two registries. It converts every silent divergence into a loud `manifest unknown`. Keep the tag as well, for humans. |
+| Tag mutability | `MUTABLE` | `IMMUTABLE_WITH_EXCLUSION` with `latest` excluded | **B** for everything you build; `MUTABLE` only for PTC repositories, where ECR needs to update cached tags. |
+| Who creates the standby's repositories | Replication auto-creates them | Terraform declares them in both regions | **B**, *and* keep the creation template as a backstop. Terraform-declared repositories are the only drift detection this layer has, and the backfill needs somewhere to land. |
+| Standby lifecycle policy | Mirror the primary's | Strictly more generous; no untagged rule for `prod/` | **B.** Storage is $0.10/GB-month. A missing image at failover is an outage. The asymmetry is the design, not an oversight. |
+| Encryption | AES256 (AWS-owned) in both regions | CMK per region | Depends entirely on the control framework, and it is **ForceNew either way** — decide before creating repositories. If CMKs are required, **two independent regional keys, not a multi-Region key**: ECR never decrypts a foreign region's ciphertext. See [[aws-kms]]. |
+| Third-party images | Pull from Docker Hub / `registry.k8s.io` directly | PTC rules in both regions, references rewritten | **B**, unconditionally. It is cheap, it removes a rate-limited third party from the failover path, and it is the one mitigation that works for Karpenter-launched surge nodes too. See [[third-party-saas-dependencies]]. |
+| Standby deploy trigger | Timer / same pipeline step as primary | EventBridge `ECR Replication Action` in the destination region | **B as the fast path, polling as the backstop.** The event fires in the standby region, so the standby converges without any dependency on the primary — but AWS emits it best-effort, so it cannot be the only gate. |
+| Replication scope | Whole registry | `prod/` prefix filter | **B.** Most registries are majority CI scratch images. This is the single largest cost lever and it costs nothing. |
+| Enhanced scanning in the standby | `CONTINUOUS_SCAN` | `SCAN_ON_PUSH` | **B.** The continuous CVE intelligence applies to the same digest in the primary; paying twice for it buys nothing. Revisit if a control demands per-registry continuous scanning. |
+| Admission policy in the standby when a signature has not replicated | `enforce` — fail closed | `audit`/`warn` — fail open, alarm loudly | **A for the primary, and a deliberate, documented, time-boxed break-glass for the standby.** Failing closed on a signature-replication lag converts a regional outage into a total outage; failing open silently is how unsigned images reach production. Neither is comfortable, which is why it must be a written decision rather than a default. |
+| Failback | Reverse replication back to the old primary | Promote the standby permanently, flip `role` | **B, usually.** It avoids a second backfill and you have just proved the new primary works. The symmetric module shape makes it a variable change. |
+
 ## Cost
 
 ### What is actually published
@@ -1292,9 +2383,11 @@ and **test it** before depending on it: sign an image, let it replicate, and run
 |---|---|---|
 | ECR private storage | **$0.10 per GB-month** | **Verified**, [ECR pricing](https://aws.amazon.com/ecr/pricing/) |
 | ECR → compute in the **same region** | **$0.00/GB** | **Verified** — same page |
-| ECR private, cross-region data transfer | **Not published on the ECR pricing page.** The page says data transferred from a private repository is *"billed to the AWS account that owns the private repository"* at tiered rates that aggregate across AWS services — i.e. it falls under standard EC2 inter-region data transfer pricing. | **Not verified for the specific EU/US/CA pairs.** Look it up on the EC2 data transfer pricing page for the exact region pair before putting a number in a budget. |
-| ECR **public**, cross-region | **$0.09/GB**, from a worked example on the ECR pricing page | Verified, but it is the *public* registry figure and should not be applied to private replication without checking |
-| Is replication itself charged as a separate line? | **The ECR pricing page does not say.** | **Not verified.** Model it as: destination storage at $0.10/GB-month, plus inter-region data transfer on each replicated byte. |
+| ECR private, data transferred **out** of a private repository | **$0.09 per GB** | **Verified** — stated under the private-registry Data Transfer heading on the [ECR pricing page](https://aws.amazon.com/ecr/pricing/). Note this is the same first-tier figure AWS uses for egress generally; it is *not* the cheaper inter-Region EC2 rate that third-party blogs quote. |
+| Is replication itself charged as a separate line? | **No — it is billed as source-region data transfer out.** The ECR pricing page states: *"Data transferred when copying images across regions using Cross Region Replication incur ECR data transfer out charges based on the source repository's region."* | **Verified.** So the replication bill lands on the **primary's** account and region, not the standby's. Budget it there. |
+| A cheaper inter-Region rate for the specific pairs (`eu-west-1`→`eu-west-2` etc.) | **Not found on an AWS page.** Third-party sources widely quote $0.02/GB for EU-to-EU inter-Region EC2 traffic, but the EC2 on-demand pricing page's data-transfer table did not render for retrieval, and the ECR page points at ECR data transfer out rates rather than the EC2 rate card. | **Not verified.** Budget at $0.09/GB, reconcile against a real bill, and correct this row afterwards. Do not put the $0.02 figure in a plan on the strength of a blog. |
+| ECR **public**, egress | 500 GB/month free anonymous, 5 TB/month authenticated, **unlimited free to AWS compute in any region** | Verified — public-registry section of the same page. Listed separately because the two tables are easy to conflate. |
+| ECR SLA | **99.9% monthly uptime per Region**, scoped to API availability | **Verified** — [ECR SLA](https://aws.amazon.com/ecr/sla/). It says nothing about replication latency, which is why there is no SLA to point at in [[#What is published]]. |
 | ECR free tier | 500 MB/month private for 12 months (new accounts); 50 GB/month public storage for all | Verified |
 | KMS | Per-key monthly charge plus request charges; ECR calls `GenerateDataKey`/`Decrypt` per layer operation | See [[aws-kms]] |
 
@@ -1312,8 +2405,9 @@ Concretely, if the `prod/` prefix is **50 GB** and you push **20 GB/month** of n
 layers:
 
 - Standby storage: 50 × $0.10 = **$5.00/month**, rising as new images land.
-- Replication transfer: 20 GB × (inter-region rate). **Look this up.** At a
-  plausible order of magnitude it is single-digit dollars per month.
+- Replication transfer: 20 GB × $0.09 = **$1.80/month**, billed to
+  `eu-west-1`'s account. If the real inter-Region rate turns out lower, this is
+  an over-estimate — which is the safe direction for a budget.
 - **Without a destination lifecycle policy this grows monotonically forever**,
   because deletes do not replicate. 20 GB/month of accumulation is $2/month of
   *additional* run-rate each month — $24/month after a year, $48 after two, and
@@ -1346,27 +2440,127 @@ layers:
 money; it is that the *shape* of the cost (unbounded growth, no deletes) is a
 symptom of the same design fact that causes the correctness problems.
 
-## Still to research
+## Open questions
 
-This note is `status: partial`. The following are written but not yet complete:
+Things this note cannot answer from outside the company.
 
-- **Terraform implementation section** — provider aliases, the registry-settings
-  root module, the full module signature for the cookiecutter monorepo, and the
-  `ForceNew` analysis. **This is the most important gap.**
-- **Migration path from single-region** — ordered, with the ordering hazards
-  (templates before replication) called out.
-- **Failover and failback procedures** for the registry specifically.
-- **Warm standby shape** section.
-- **The consolidated Gotchas list.**
-- **Decisions to make** table.
-- **Open questions** and the full **Sources** list with per-source annotations.
-- **Verify**: the exact inter-region data transfer rate for `eu-west-1` →
-  `eu-west-2`, `us-east-1` → `us-west-2`, `ca-central-1` → `ca-west-1` against
-  the EC2 data transfer pricing page.
-- **Verify**: whether registry replication propagates OCI **referrer** artefacts
-  (AWS Signer / Notation signatures). Currently unverified.
-- **Verify**: `ForceNew` behaviour of `aws_ecr_repository.encryption_configuration`
-  and `image_tag_mutability` in `hashicorp/aws` v5.x/v6.x against the provider
-  source, not just the docs.
-- **Check**: whether any AWS regional outage postmortem names ECR as an
-  aggravating factor — see [[aws-regional-outages]].
+1. **How are repositories named today — per-region, per-environment, or flat?**
+   This is the blocking question. Replication preserves names and cannot rename,
+   and `aws_ecr_repository.name` is `ForceNew`, so a per-region naming scheme
+   turns the whole migration into a rename-and-copy project. Answer this before
+   anything else. Same shape as [[dynamodb-table-naming-migration]].
+2. **Is the standby cluster in the same AWS account as the registry?** Decides
+   whether you need a destination registry permissions policy, cross-account
+   repository policies, and blob mounting on both registries. [[aws-eks]] asks
+   the same question — it needs one answer for the estate.
+3. **Are repositories encrypted with AES256 or a CMK today?** ForceNew and
+   API-immutable, so if the answer needs to change, it changes via a
+   copy-and-cut-over, not an `apply`. See [[aws-kms]].
+4. **How many hardcoded `*.dkr.ecr.<region>.amazonaws.com` strings exist across
+   the deploy repo, the Terraform repo, Helm values, Dockerfiles and CI
+   workflows?** One `grep` produces the number, and the number is the real size
+   of the spine problem. Nobody's estimate has ever been high enough.
+5. **Does the pipeline deploy by tag or by digest today?** Determines whether
+   [[#What the CI pipeline must change to]] is a small change or a project.
+6. **Is anything signed, and with which scheme?** cosign's legacy derived-tag
+   layout and the OCI 1.1 referrers layout behave differently under both
+   replication and lifecycle policy. The recommendation differs.
+7. **What is the total size of the `prod/` prefix, and the monthly push
+   volume?** Two numbers, both one CLI call, and they turn the cost model from a
+   shape into a figure.
+8. **What is the real replication latency for this estate?** AWS publishes only
+   "majority under 30 minutes". The EventBridge correlation in
+   [[#Detecting replication completion]] is a few dozen lines and produces a
+   real p99. Nobody will know the true number until somebody measures it.
+9. **Is `ca-west-1` opted in across every account in the organisation?** A
+   multi-day, batched prerequisite for the CA pair that is invisible in
+   `terraform plan`. Carry the answer into [[region-pair-selection]].
+10. **Which service principal does ECR assume for a repository creation
+    template's `custom_role_arn`?** Not confirmable from public documentation
+    with enough certainty to ship. One CloudTrail `AssumeRole` event after the
+    first replication settles it.
+11. **Are there container-image Lambdas?** They cannot use a pull-through cache
+    rule and need real repositories in both regions. See [[aws-lambda]].
+12. **Does the control framework require continuous enhanced scanning in a DR
+    standby?** If yes, the scanning line roughly doubles and it should be in
+    [[cost-model]] rather than discovered on a bill.
+
+### On regional outages
+
+The brief asked whether any AWS regional outage postmortem names ECR as an
+aggravating factor. **Checked, and the honest answer is: not in AWS's own
+words.** The official
+[summary of the October 2025 US-EAST-1 event](https://aws.amazon.com/message/101925/)
+names container launch failures and cluster scaling delays across ECS, EKS and
+Fargate, but does **not** name ECR or image pulls as a contributing mechanism.
+Third-party write-ups of the same event — for example
+[Jonathon Belotti's analysis](https://thundergolfer.com/blog/aws-us-east-1-outage-oct20) —
+list ECR among the ~140 affected services, but as a *casualty* of the DynamoDB
+and EC2 failures rather than as an amplifier.
+
+The ECR-shaped risk that *is* real and *is* documented is structural rather than
+incident-derived: **ECR Public's registry and control plane live in `us-east-1`**
+(`api.ecr-public.us-east-1.amazonaws.com`), and EKS add-on images and a great
+many open-source images are served from it. That makes ECR Public a shared
+`us-east-1` dependency for clusters in every Region — including, uncomfortably,
+the US pair's own standby, `us-west-2`, whose failover scenario is precisely
+"`us-east-1` is gone". **A pull-through cache rule for `public.ecr.aws` in every
+Region converts that shared dependency into a local one**, and for the US pair it
+is not a nice-to-have. This is the strongest concrete argument in the note for
+doing the PTC work, and it belongs in [[aws-regional-outages]] and
+[[third-party-saas-dependencies]] as well as here.
+
+No postmortem specifically attributing a failed multi-region failover to ECR
+replication gaps was found. The failure mode is well described in guidance;
+nobody appears to have published the incident. Same finding as [[aws-eks]]'s.
+
+## Sources
+
+### AWS documentation — ECR
+
+- [Private image replication in Amazon ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/replication.html) — the load-bearing source for this note. Every "Considerations" bullet quoted above comes from here: not-retroactive, name preservation, no chaining, no deletes, the "majority under 30 minutes" latency statement, the 25-rule/25-destination/100-filter limits, the tag-immutability-produces-untagged behaviour, blob mounting, the opt-in-Region requirement, and the explicit statement that repository and lifecycle policies are not replicated.
+- [Private registry permissions in Amazon ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry-permissions.html) — the destination-only registry policy for cross-account replication, and the `ecr:ReplicateImage` + `ecr:CreateRepository` pair.
+- [Repository creation templates](https://docs.aws.amazon.com/AmazonECR/latest/userguide/repository-creation-templates.html) — the only mechanism that gives a replication-created repository a lifecycle policy, a repository policy, KMS encryption or tag-immutability settings. Also the source of the "only applied during repository creation" caveat and the `custom_role_arn` requirement when using KMS or resource tags.
+- [Amazon ECR service quotas](https://docs.aws.amazon.com/AmazonECR/latest/userguide/service-quotas.html) — the throttling arithmetic: `GetAuthorizationToken` 500/s, `BatchGetImage` 2,000/s, `GetDownloadUrlForLayer` 3,000/s, `PutImage` 10/s. All per-Region, per-account, all adjustable.
+- [Amazon ECR endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/ecr.html) — the `ca-west-1` parity check. Confirms `api.ecr`, `dkr.ecr` and dual-stack endpoints exist in Calgary, and that no `ecr-fips` endpoint does (nor in `ca-central-1`, so not a regression).
+- [Using pull through cache rules](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html) — supported upstreams, the Secrets Manager `ecr-pullthroughcache/` naming rule, the 24-hour image / 6-hour referrer revalidation windows, the "first pull may require a route to the internet" warning, the Lambda exclusion, and the "don't push into a PTC repository" statement.
+- [Amazon ECR events and EventBridge](https://docs.aws.amazon.com/AmazonECR/latest/userguide/ecr-eventbridge.html) — the `ECR Replication Action` and `ECR Image Action` event schemas, and the "emitted on a best effort basis" caveat that stops you using the event as a correctness gate.
+- [Encryption at rest for Amazon ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/encryption-at-rest.html) — the key must be in the same Region as the repository, encryption configuration is immutable after creation, the two KMS grants ECR creates, and the `aws:ecr:arn` encryption context.
+- [`DescribeImageReplicationStatus` API reference](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_DescribeImageReplicationStatus.html) — the authoritative per-image, per-destination replication status (`IN_PROGRESS` / `COMPLETE` / `FAILED`) that a CI gate should poll.
+- [Amazon ECR lifecycle policies](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html) — rule evaluation semantics and the `start-lifecycle-policy-preview` dry-run that is the cheapest guard against a standby policy deleting a live digest.
+
+### AWS announcements and blogs
+
+- [Amazon ECR now supports EventBridge notifications for replication (AWS, July 2024)](https://aws.amazon.com/about-aws/whats-new/2024/07/amazon-ecr-eventbridge-ecrs-replication-feature/) — when the completion signal became available, and the destination-region emission that makes event-driven standby deploys possible.
+- [Amazon ECR announces pull through cache support for ECR private registries (AWS, March 2025)](https://aws.amazon.com/about-aws/whats-new/2025/03/amazon-ecr-pull-through-cache/) — ECR-to-ECR PTC. Named here mainly to rule it out: its upstream is the region you are failing away from.
+- [Diving into OCI Image and Distribution 1.1 support in Amazon ECR (AWS Open Source Blog)](https://aws.amazon.com/blogs/opensource/diving-into-oci-image-and-distribution-1-1-support-in-amazon-ecr/) — **resolves the signature question.** States that ECR's replication feature replicates referrers to configured destinations on push, so signatures and SBOMs land alongside replicated images; and that lifecycle policies protect reference artefacts whose subject image is still present, cleaning them up within 24 hours of the subject's deletion.
+- [Amazon ECR supports OCI Image and Distribution specification v1.1 (AWS, June 2024)](https://aws.amazon.com/about-aws/whats-new/2024/06/amazon-ecr-oci-image-distribution-version-1-1) — confirms referrer support is available in all commercial Regions, which matters for the `ca-west-1` check.
+
+### Pricing
+
+- [Amazon ECR pricing](https://aws.amazon.com/ecr/pricing/) — $0.10/GB-month private storage; $0.00/GB to AWS compute in the same Region; **$0.09/GB for data transferred out of a private repository**; and the footnote that *"Data transferred when copying images across regions using Cross Region Replication incur ECR data transfer out charges based on the source repository's region"*. That footnote is the answer to "is replication billed separately" — it is billed as source-region data transfer out, not as a replication line item.
+- [Amazon ECR Service Level Agreement](https://aws.amazon.com/ecr/sla/) — 99.9% Monthly Uptime Percentage per Region, defined against API request success. Cited for what it *doesn't* cover: replication latency is outside the SLA entirely.
+- [AWS Regions and opt-in management](https://docs.aws.amazon.com/general/latest/gr/rande-manage.html) — `ca-west-1` is an opt-in Region; enabling is asynchronous ("a few minutes … sometimes several hours"); disabling does not delete resources or stop charges. Combined with the replication doc's opt-in requirement, this is the CA pair's real prerequisite.
+
+### Terraform
+
+- [`aws_ecr_repository` resource docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_repository) and [the provider source for that resource](https://github.com/hashicorp/terraform-provider-aws/blob/main/internal/service/ecr/repository.go) — **checked against the source, not just the docs.** `name` and the whole `encryption_configuration` block (including `encryption_type` and `kms_key`) are `ForceNew: true`. `image_tag_mutability`, `image_tag_mutability_exclusion_filter` and `image_scanning_configuration` are **not** — the update path calls `PutImageTagMutability` and `PutImageScanningConfiguration` in place.
+- [`aws_ecr_repository_creation_template` resource docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_repository_creation_template) — `prefix` (with the special `ROOT` value) forces replacement; `applied_for` takes `CREATE_ON_PUSH`, `PULL_THROUGH_CACHE`, `REPLICATION`; `custom_role_arn` is required when the template sets resource tags or KMS encryption.
+- [`aws_ecr_replication_configuration` resource docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_replication_configuration) — the registry-scoped singleton. Confirms there is one per account per Region and that a second declaration replaces rather than merges.
+
+### Outages
+
+- [Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region, October 2025 (AWS)](https://aws.amazon.com/message/101925/) — AWS's own post-event summary. Names container launch failures and cluster scaling delays across ECS, EKS and Fargate; **does not name ECR or image pulls** as a mechanism. The basis for the negative finding in [[#On regional outages]].
+- [More Than DNS: The 14 hour AWS us-east-1 outage — Jonathon Belotti](https://thundergolfer.com/blog/aws-us-east-1-outage-oct20) — third-party analysis listing ECR among the affected services. Useful for scope; explicitly **not** an AWS source and it treats ECR as a casualty, not a cause.
+
+### Third party
+
+- [Docker Hub usage and rate limits](https://docs.docker.com/docker-hub/usage/) — 100 pulls per 6 hours per IPv4 address / IPv6 /64 for unauthenticated users; 200 for authenticated personal accounts; unlimited on paid business tiers. The NAT-gateway-shared-IP arithmetic in [[#The Docker Hub rate-limit amplifier]] rests entirely on this page.
+- [google/go-containerregistry — `crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/doc/crane_copy.md), [regclient — `regctl image copy`](https://github.com/regclient/regclient/blob/main/docs/regctl.md) and [containers/skopeo — `skopeo sync`](https://github.com/containers/skopeo/blob/main/docs/skopeo-sync.1.md) — the three registry-to-registry copy tools that preserve digests and multi-arch manifest lists. `regctl --digest-tags` is the one that also carries cosign's digest-derived signature tags.
+
+### Explicitly not found
+
+- **No ECR replication SLA, and no published percentile distribution.** Searched specifically. The entire published guarantee is *"The majority of images replicate in less than 30 minutes, but in rare cases the replication might take longer."* There is no ECR equivalent of S3 Replication Time Control. If you want a p99, you have to measure it yourself — see [[#Detecting replication completion]].
+- **No AWS-provided backfill for pre-existing images.** There is no ECR analogue of S3 Batch Replication. Confirmed by absence across the replication docs, the API reference and the ECR console.
+- **No per-Region ECR feature-support matrix.** AWS publishes endpoints per Region and a quota table that says "Each supported Region" for every entry, but nothing that states which Regions support replication, PTC or referrers individually. The `ca-west-1` replication answer is therefore "no exclusion found, verify with a real `put-replication-configuration`" rather than a documented yes.
+- **No published AWS inter-Region data transfer rate specific to ECR replication beyond the $0.09/GB private-repository figure.** Third-party blogs widely quote $0.02/GB for EU-to-EU inter-Region EC2 traffic; that figure is **not** on an AWS page I could retrieve, and the ECR pricing page's own footnote points at ECR data transfer out rates rather than the EC2 rate card. Budget with $0.09/GB and reconcile against a real bill.

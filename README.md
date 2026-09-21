@@ -92,7 +92,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-eks]] | ✅ |
 | [[eks-workload-delivery]] | ✅ |
 | [[eks-stateful-workloads]] | ⬜ |
-| [[aws-ecr]] | 🟡 partial |
+| [[aws-ecr]] | ✅ |
 | [[aws-lambda]] | ✅ |
 | [[aws-step-functions]] | 🟡 partial — in-flight executions are the RPO gap |
 
