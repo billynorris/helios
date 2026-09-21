@@ -174,12 +174,12 @@ with [[aws-kms]] since so much leans on it.
 | [[data-residency]] | ⬜ — Ireland→London adequacy is live legal risk |
 | [[regulatory-drivers]] | ⬜ |
 | [[security-posture-of-the-standby]] | ⬜ |
+| [[aws-regional-outages]] | ✅ |
+| [[lessons-and-antipatterns]] | ✅ |
 
 `05-cost/` and `06-compliance/` are still **empty directories**. Nothing in this
 vault currently costs the programme anything or tells it what it is legally
 allowed to do.
-| [[aws-regional-outages]] | ✅ |
-| [[lessons-and-antipatterns]] | ✅ |
 | [[07-case-studies/index]] | ⬜ |
 
 ## Open threads
