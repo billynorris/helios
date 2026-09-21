@@ -90,7 +90,7 @@ with [[aws-kms]] since so much leans on it.
 | [[eks-stateful-workloads]] | ⬜ |
 | [[aws-ecr]] | 🟡 partial |
 | [[aws-lambda]] | ✅ |
-| [[aws-step-functions]] | ⬜ |
+| [[aws-step-functions]] | 🟡 partial — in-flight executions are the RPO gap |
 
 **Messaging and streaming**
 
@@ -99,7 +99,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-sqs]] | ✅ |
 | [[messaging-in-flight-data-loss]] | ✅ |
 | [[aws-eventbridge]] | ✅ |
-| [[aws-sns]] | ⬜ |
+| [[aws-sns]] | ✅ |
 | [[aws-msk-kafka]] | ⬜ |
 | [[aws-kinesis]] | ⬜ |
 
