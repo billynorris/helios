@@ -88,7 +88,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-eks]] | ✅ |
 | [[eks-workload-delivery]] | ✅ |
 | [[eks-stateful-workloads]] | ⬜ |
-| [[aws-ecr]] | ⬜ — **lost in a cut-off wave, re-research** |
+| [[aws-ecr]] | 🟡 partial |
 | [[aws-lambda]] | ✅ |
 | [[aws-step-functions]] | ⬜ |
 
@@ -118,7 +118,7 @@ with [[aws-kms]] since so much leans on it.
 
 | Note | Status |
 |---|---|
-| [[aws-s3]] | ⬜ — **lost in a cut-off wave, re-research** |
+| [[aws-s3]] | 🟡 partial — missing Batch Replication, the live-migration path |
 | [[aws-efs-ebs]] | ⬜ |
 | [[aws-backup]] | ⬜ |
 | [[aws-vpc-networking]] | ✅ |
@@ -131,6 +131,7 @@ with [[aws-kms]] since so much leans on it.
 |---|---|
 | [[aws-bedrock]] | ⬜ |
 | [[aws-ses]] | ⬜ |
+| [[aws-managed-grafana]] | 🟡 partial — **AMG does not exist in `ca-west-1`** |
 | [[observability-vendors-multi-region]] | ⬜ — Datadog / Grafana / Prometheus |
 | [[third-party-saas-dependencies]] | ⬜ — the shared-fate audit |
 
@@ -160,6 +161,7 @@ with [[aws-kms]] since so much leans on it.
 |---|---|
 | [[failover-orchestration]] | ✅ |
 | [[split-brain-and-fencing]] | ✅ — includes failback |
+| [[route53-application-recovery-controller]] | 🟡 partial — **verdict: don't buy the £1.8k/mo cluster** |
 | [[dr-testing-and-gamedays]] | ⬜ |
 | [[failover-runbook-template]] | ⬜ |
 
