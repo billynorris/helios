@@ -120,7 +120,7 @@ with [[aws-kms]] since so much leans on it.
 |---|---|
 | [[aws-s3]] | 🟡 partial — missing Batch Replication, the live-migration path |
 | [[aws-efs-ebs]] | ⬜ |
-| [[aws-backup]] | ⬜ |
+| [[aws-backup]] | ✅ — not the RTO mechanism; the RPO floor, evidence layer and ransomware answer |
 | [[aws-vpc-networking]] | ✅ |
 | [[cross-region-connectivity]] | ⬜ |
 | [[observability-multi-region]] | ⬜ — **lost in a cut-off wave, re-research** |
@@ -176,24 +176,32 @@ with [[aws-kms]] since so much leans on it.
 | [[security-posture-of-the-standby]] | ⬜ |
 | [[aws-regional-outages]] | ✅ |
 | [[lessons-and-antipatterns]] | ✅ |
+| [[07-case-studies/index]] | ⬜ |
 
 `05-cost/` and `06-compliance/` are still **empty directories**. Nothing in this
 vault currently costs the programme anything or tells it what it is legally
 allowed to do.
-| [[07-case-studies/index]] | ⬜ |
 
 ## Open threads
 
 Two questions the vault can't answer for you:
 
-1. **`ca-west-1` parity — the evidence is now stacking up against it.** Calgary
-   is young. [[region-pair-selection]] collects the per-service findings, and as
-   of 2026-09-20 two more services have failed the check: [[aws-cognito]]
-   (not a multi-region-replication Region, so the CA pair has *no* Cognito DR
-   path at all) and [[aws-opensearch]] (cross-cluster replication blocked by
-   opt-in-Region rules). Every wave of research makes the CA pair look worse.
-   If it fails, the pair changes — and leaving Canada has data-residency
-   consequences that may be a hard blocker rather than a cost question.
+1. **`ca-west-1` parity — and the fact that the CA pair cannot actually change.**
+   Calgary is young and keeps failing. As of 2026-09-21 the register reads:
+   [[aws-cognito]] (not a multi-region-replication Region — the CA pair has *no*
+   Cognito DR path at all), [[aws-opensearch]] (cross-cluster replication blocked
+   by opt-in-Region rules), [[aws-managed-grafana]] (**does not exist there**),
+   and [[aws-backup]] (no Audit Manager, no logically air-gapped vault as a copy
+   target — so the region under the most regulator attention has no native
+   compliance-evidence layer).
+
+   **The reframing that matters:** `ca-central-1` and `ca-west-1` are the only
+   two AWS Regions in Canada, so "pick a different standby" is not on the table.
+   The real choice is **accept the gaps with compensating controls** or **leave
+   Canada**, and leaving is likely not permissible on residency grounds. This is
+   no longer a parity question to resolve — it is a set of gaps to sign off.
+   [[aws-backup]] takes the accept-and-compensate position; [[region-pair-selection]]
+   should be updated to match, and someone senior needs to own that decision.
 2. **Which RTO are you held to?** 15 minutes from *incident start* and 15
    minutes from *decision to fail over* are wildly different targets.
    [[failover-orchestration]] decomposes the budget. Settle this with
