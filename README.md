@@ -62,7 +62,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-acm]] | ✅ |
 | [[aws-route53]] | ✅ |
 | [[aws-alb-nlb]] | ✅ |
-| [[aws-cloudfront]] | 🟡 **partial** — TL;DR only; see its "Still to research" |
+| [[aws-cloudfront]] | ✅ researched — origin groups are read-path only; the failover switch is a CloudFront Function + KeyValueStore flag. 16 July 2026 VPC Origins incident verified (duration softened). |
 | [[aws-api-gateway]] | ✅ |
 | [[aws-global-accelerator]] | ⬜ — should pick the winner vs Route 53 / origin groups |
 | [[aws-waf-shield]] | ⬜ — referenced by several notes, never written |
