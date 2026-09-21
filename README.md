@@ -73,6 +73,10 @@ with [[aws-kms]] since so much leans on it.
 |---|---|
 | [[aws-rds-postgres]] | ✅ |
 | [[aws-aurora-global-database]] | ✅ |
+| [[aurora-failover-mechanics]] | 🔴 **UNSOURCED** — cites nothing; treat as a research plan, not findings |
+| [[rds-aurora-failure-modes]] | ⬜ |
+| [[rds-standby-sizing-and-cost]] | ⬜ — the right-size-the-standby question |
+| [[rds-aurora-migration-path]] | ⬜ |
 | [[rds-vs-aurora-decision]] | ✅ |
 | [[aws-dynamodb]] | ✅ |
 | [[dynamodb-table-naming-migration]] | ✅ — unblocks work in progress |
