@@ -35,6 +35,14 @@ Also give each agent: the two `00-meta/` paths, the exact output paths in order,
 the specific sub-topics to dig into, a target of 20+ distinct searches, and the
 no-invented-sources rule.
 
+**Do not launch more than about four agents at once.** On 2026-09-20 a wave of
+ten agents covering 26 notes exhausted the account's session limit; all ten died
+mid-research and only **four** notes reached disk. The write-as-you-go rule above
+is what saved those four — without it the wave would have produced nothing — but
+the real lesson is that a note costs roughly 30–45 tool calls and 20+ searches,
+so a wave's true size is that number times the agent count. Launch a small wave,
+commit it, launch the next. A committed note is worth more than a wide fan-out.
+
 ## Standards
 
 - **Never invent a URL, quote, price, benchmark, AZ count, incident or case
