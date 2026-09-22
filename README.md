@@ -123,7 +123,7 @@ with [[aws-kms]] since so much leans on it.
 | Note | Status |
 |---|---|
 | [[aws-s3]] | ✅ |
-| [[aws-efs-ebs]] | ⬜ |
+| [[aws-efs-ebs]] | ✅ — EFS meets both targets (`ca-west-1` **passes**); EBS meets neither, push block state off EBS |
 | [[aws-backup]] | ✅ — not the RTO mechanism; the RPO floor, evidence layer and ransomware answer |
 | [[aws-vpc-networking]] | ✅ |
 | [[cross-region-connectivity]] | ⬜ |
@@ -191,13 +191,29 @@ allowed to do.
 Two questions the vault can't answer for you:
 
 1. **`ca-west-1` parity — and the fact that the CA pair cannot actually change.**
-   Calgary is young and keeps failing. As of 2026-09-21 the register reads:
-   [[aws-cognito]] (not a multi-region-replication Region — the CA pair has *no*
-   Cognito DR path at all), [[aws-opensearch]] (cross-cluster replication blocked
-   by opt-in-Region rules), [[aws-managed-grafana]] (**does not exist there**),
-   and [[aws-backup]] (no Audit Manager, no logically air-gapped vault as a copy
-   target — so the region under the most regulator attention has no native
-   compliance-evidence layer).
+   As of 2026-09-22 the register stands at **five fails, two passes**, and the
+   two passes are the important ones.
+
+   **Fails:** [[aws-cognito]] (not a multi-region-replication Region — the CA
+   pair has *no* Cognito DR path at all), [[aws-opensearch]] (cross-cluster
+   replication blocked by opt-in-Region rules), [[aws-managed-grafana]] (**does
+   not exist there**), [[aws-backup]] (no Audit Manager, no logically
+   air-gapped vault as a copy target — the region under the most regulator
+   attention has no native compliance-evidence layer), and [[aws-cloudfront]]
+   (no Origin Shield in either Canadian Region, and the documented
+   `ca-central-1` fallback is `us-east-1`, which is a residency problem dressed
+   as a performance setting).
+
+   **Passes — and they carry the data:** [[aurora-failover-mechanics]] (Aurora
+   Global Database is supported, verified against the supported-Regions table)
+   and [[aws-efs-ebs]] (EFS Replication is available in every Region where EFS
+   runs, and Calgary's EBS quotas are *higher* than Montreal's).
+
+   **So the shape of the problem has changed.** The database and file layers —
+   the parts that actually hold state and drive RPO — work in Calgary. What
+   fails is identity, search, observability and compliance tooling. That is a
+   materially better position than the early register suggested, and it argues
+   for accept-and-compensate rather than a redesign.
 
    **The reframing that matters:** `ca-central-1` and `ca-west-1` are the only
    two AWS Regions in Canada, so "pick a different standby" is not on the table.
