@@ -64,7 +64,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-alb-nlb]] | ✅ |
 | [[aws-cloudfront]] | ✅ researched — origin groups are read-path only; the failover switch is a CloudFront Function + KeyValueStore flag. 16 July 2026 VPC Origins incident verified (duration softened). |
 | [[aws-api-gateway]] | ✅ |
-| [[aws-global-accelerator]] | ⬜ — should pick the winner vs Route 53 / origin groups |
+| [[aws-global-accelerator]] | 🟡 partial — cited, but the three-way verdict is unfinished |
 | [[aws-waf-shield]] | ⬜ — referenced by several notes, never written |
 
 **Data stores**
@@ -122,7 +122,7 @@ with [[aws-kms]] since so much leans on it.
 
 | Note | Status |
 |---|---|
-| [[aws-s3]] | 🟡 partial — missing Batch Replication, the live-migration path |
+| [[aws-s3]] | ✅ |
 | [[aws-efs-ebs]] | ⬜ |
 | [[aws-backup]] | ✅ — not the RTO mechanism; the RPO floor, evidence layer and ransomware answer |
 | [[aws-vpc-networking]] | ✅ |
