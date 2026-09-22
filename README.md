@@ -65,7 +65,7 @@ with [[aws-kms]] since so much leans on it.
 | [[aws-cloudfront]] | ✅ researched — origin groups are read-path only; the failover switch is a CloudFront Function + KeyValueStore flag. 16 July 2026 VPC Origins incident verified (duration softened). |
 | [[aws-api-gateway]] | ✅ |
 | [[aws-global-accelerator]] | 🟡 partial — cited, but the three-way verdict is unfinished |
-| [[aws-waf-shield]] | ⬜ — referenced by several notes, never written |
+| [[aws-waf-shield]] | 🟡 partial — 555 lines, cited; three sections outstanding |
 
 **Data stores**
 
@@ -73,7 +73,7 @@ with [[aws-kms]] since so much leans on it.
 |---|---|
 | [[aws-rds-postgres]] | ✅ |
 | [[aws-aurora-global-database]] | ✅ |
-| [[aurora-failover-mechanics]] | 🔴 **UNSOURCED** — cites nothing; treat as a research plan, not findings |
+| [[aurora-failover-mechanics]] | ✅ — citation pass done 2026-09-22; **`ca-west-1` IS supported** |
 | [[rds-aurora-failure-modes]] | ⬜ |
 | [[rds-standby-sizing-and-cost]] | ⬜ — the right-size-the-standby question |
 | [[rds-aurora-migration-path]] | ⬜ |

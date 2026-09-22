@@ -2,12 +2,14 @@
 title: Aurora Global Database — Failover Mechanics
 service: aurora-postgresql-global-database
 tags: [service, multi-region, aurora, postgres, failover, runbook, operations, mechanics]
-status: partial
+status: researched
 replication: native (storage-layer, dedicated infrastructure)
 rpo_achievable: "0 for switchover; seconds for managed failover; equal to AuroraGlobalDBRPOLag at the moment of failure"
-rto_achievable: "'within a few minutes' (AWS) for managed failover with a warm reader; the application's reconnect is the long pole, not the database"
+rto_achievable: "'within a few minutes' (AWS, verbatim) for managed failover with a warm reader; the application's reconnect is the long pole, not the database"
 meets_targets: yes — the database clears RTO 15m comfortably; endpoint/connection-pool handling is where the budget is actually spent
-updated: 2026-09-21
+ca_west_1: supported — verified against AWS's supported-Regions table 2026-09-22, row identical to ca-central-1
+sources_verified: 2026-09-22 — 16 first-party AWS pages plus kernel.org; 2 minor claims uncited (JVM/CoreDNS DNS caching), see Sources
+updated: 2026-09-22
 ---
 
 # Aurora Global Database — Failover Mechanics
@@ -20,31 +22,40 @@ updated: 2026-09-21
 > whole-estate sequence and [[split-brain-and-fencing]] for the fencing theory —
 > this note is the database-shaped slice of both.
 
-> [!danger] UNSOURCED — do not build a runbook from this yet
-> **This note cites nothing.** It contains no URLs and has no Sources section,
-> which every other note in this vault has and which
-> [[research-brief]] requires. It was produced in a research wave that hit a
-> session limit, and the citation pass never ran.
+> [!check] Citation pass completed 2026-09-22
+> This note previously carried an UNSOURCED banner. **It has now been checked
+> claim by claim against first-party AWS documentation** — see [[#Sources]] for
+> the 16 pages read and for an explicit "Could not verify" list.
 >
-> The structure is sound and the mechanisms described are plausible, but **every
-> factual claim in it is currently unverified** — including the specific
-> CloudWatch metric names, the `ca-west-1` support claim in the first TL;DR
-> bullet, the AWS timing quotes, and the API call names. Treat the whole note as
-> a **research plan**, not as findings.
+> Results worth knowing before you read on:
+> - **The `ca-west-1` claim held up.** Calgary is in the Aurora Global Database
+>   supported-Regions table with a row identical to Montreal. The CA pair does
+>   **not** need a different database DR design.
+> - **All 21 RDS event IDs are real** and carry the messages quoted here.
+> - **All five `AuroraGlobalDB*` CloudWatch metric names are real**, but one
+>   emission Region was wrong and has been corrected.
+> - **`tcp_retries2` was understated** and has been corrected upward.
+> - Two claims about JVM and CoreDNS DNS caching remain uncited, and the
+>   subscribable event category for the write-fencing events is genuinely
+>   undocumented. Both are called out in place and in [[#Open questions]].
 >
-> Nothing here should reach a failover runbook until the sources pass is done.
-> An unsourced claim that looks authoritative at 03:00 is the exact failure mode
-> [[lessons-and-antipatterns]] warns about.
+> That last item is the only thing in this note an automation would be built on
+> that AWS does not pin down. Everything else here is safe to compile a runbook
+> from.
 
 ## TL;DR
 
-- **`ca-west-1` is supported.** Aurora Global Database's supported-Regions table
-  lists **Canada West (Calgary)** for Aurora PostgreSQL 11 through 18 with the
-  same version floors as `ca-central-1`, and for Aurora MySQL 2/3/8.4 as well.
-  Unlike Cognito MRR, OpenSearch CCR, Managed Grafana and Backup Audit Manager,
-  **the CA pair does not need a different database DR design**. This is the one
-  piece of good `ca-west-1` news in the vault and it should be recorded as such
-  in [[region-pair-selection]]. (Caveats are instance-class and opt-in-Region
+- **`ca-west-1` is supported — verified against the supported-Regions table.**
+  AWS's [supported Regions and DB engines table for Aurora global
+  databases](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.Aurora_Fea_Regions_DB-eng.Feature.GlobalDatabase.html)
+  lists **Canada West (Calgary)** with a row *identical* to Canada (Central):
+  Aurora PostgreSQL 18.3+, 17.4+, 16.1+, 15.2+, 14.3+, 13.4+, 12.8+ and
+  "11.9 and version 11.13 and higher"; and Aurora MySQL 3.01.0+, 2.07.0+ and
+  "all available versions" of 8.4. Checked 2026-09-22. Unlike Cognito MRR,
+  OpenSearch CCR, Managed Grafana and Backup Audit Manager, **the CA pair does
+  not need a different database DR design**. This is the one piece of good
+  `ca-west-1` news in the vault and it should be recorded as such in
+  [[region-pair-selection]]. (Caveats are instance-class and opt-in-Region
   shaped, not feature-shaped — see [[#What blocks a failover]].)
 - **There are two failover paths and they are different operations, not two
   settings on one operation.** Managed failover (`FailoverGlobalCluster`)
@@ -111,14 +122,18 @@ in an environment variable named for its *role in the command*, not for the pair
 
 ### What it is for
 
-AWS lists exactly three use cases, verbatim:
+AWS lists exactly three use cases, verbatim, on [Using switchover or failover in
+Amazon Aurora Global
+Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-disaster-recovery.html):
 
 > For "regional rotation" requirements imposed on specific industries. For
 > example, financial service regulations might want tier-0 systems to switch to a
 > different Region for several months to ensure that disaster recovery procedures
 > are regularly exercised.
 
-> For multi-Region "follow-the-sun" applications.
+> For multi-Region "follow-the-sun" applications. For example, a business might
+> want to provide lower latency writes in different Regions based on business
+> hours across different time zones.
 
 > As a zero-data-loss method to fail back to the original primary Region after a
 > failover.
@@ -321,7 +336,7 @@ itself. AWS's August 2023 launch announcement for the feature used the phrase
 "typically a minute" for converting a secondary into the new primary. **Both are
 vendor claims and neither is an SLA.** No independent, non-AWS measurement of an
 unplanned Aurora Global Database cross-Region failover during a real Region event
-was found — see [[#What is and is not publicly known]].
+was found — see the "Could not verify" list in [[#Sources]].
 
 For the secondary-rebuild tail (irrelevant to a two-Region pair, relevant if a
 third Region is ever added): "The duration of the complete rebuilding task can
@@ -380,9 +395,13 @@ keeps accepting writes. Compare with managed failover, which at least *tries*.
 [[split-brain-and-fencing]].
 
 **3. The global cluster does not clean itself up.** After you detach everything,
-"The Aurora global database might remain in the Databases list, with zero Regions
-and AZs." You now have a zombie `aws_rds_global_cluster` in your Terraform state
-pointing at nothing.
+per [Removing a cluster from an Amazon Aurora global
+database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-detaching.html):
+"The Aurora global database might remain in the **Databases** list, with zero
+Regions and AZs." You now have a zombie `aws_rds_global_cluster` in your
+Terraform state pointing at nothing. Note also that `remove-from-global-cluster`
+takes the **ARN** for `--db-cluster-identifier` — AWS's own example passes
+`{{secondary_cluster_ARN}}`.
 
 **4. Rebuilding the topology is a full cross-Region reseed.** Step 5 —
 "Add an AWS Region" — is a fresh secondary build: a complete copy of the storage
@@ -450,23 +469,56 @@ distances; do not assume one pair's number generalises.
 
 ### The metrics, with the real names
 
-| Metric | Emitted where | What it means |
-|---|---|---|
-| **`AuroraGlobalDBRPOLag`** | **Secondary** cluster | **The one that matters.** Milliseconds between the most recent committed user transaction on the primary and the most recent committed user transaction present on this secondary. This *is* your RPO. For Aurora PostgreSQL it is available on all versions. |
-| `AuroraGlobalDBReplicationLag` | Secondary cluster | The older, coarser lag metric. AWS directs Aurora MySQL users below 3.04.0/2.12.0 to this one instead. For Aurora PostgreSQL, prefer `AuroraGlobalDBRPOLag`. |
-| `AuroraGlobalDBDataTransferBytes` | Primary | Bytes of redo shipped to secondaries. Useful as a *liveness* signal — a flatline means replication has stopped even if lag has not yet climbed. |
-| `AuroraGlobalDBReplicatedWriteIO` | Secondary | Replicated write I/O. This is the **billing** metric as much as the operational one — see [[cost-model]]. |
-| `AuroraGlobalDBProgressLag` | Secondary | How far behind the secondary volume is in applying redo, distinct from RPO lag. |
+All five names below were checked against AWS's [cluster-level CloudWatch metrics
+table for Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html#Aurora.AuroraMySQL.Monitoring.Metrics.clusters)
+on 2026-09-22. All five exist, all five are spelled as shown, and — this is the
+correction — **all five are emitted only in secondary Regions.** Descriptions in
+quotes are AWS's.
+
+| Metric | Emitted where | Units | AWS's description |
+|---|---|---|---|
+| **`AuroraGlobalDBRPOLag`** | **Secondary only** | Milliseconds | "the recovery point objective (RPO) lag time. This metric measures how far the secondary cluster is behind the primary cluster for user transactions." **This *is* your RPO.** |
+| `AuroraGlobalDBReplicationLag` | Secondary only | Milliseconds | "the average time elapsed replicating updates between the primary cluster's replication server and the secondary cluster's replication server." The older, coarser metric |
+| `AuroraGlobalDBDataTransferBytes` | **Secondary only** — *see correction below* | Bytes | "the amount of redo log data transferred from the source AWS Region to a secondary AWS Region" |
+| `AuroraGlobalDBReplicatedWriteIO` | Secondary only | Count | "the number of write I/O operations replicated from the primary AWS Region to the cluster volume in a secondary AWS Region." AWS states billing for the primary Region uses this metric "to account for cross-Region replication within the global database" — so it is the **billing** metric as much as the operational one. [[cost-model]] |
+| `AuroraGlobalDBProgressLag` | Secondary only | Milliseconds | "the measure of how far the secondary cluster's storage volume is behind the primary cluster's storage volume for both user transactions and system transactions" |
+
+> [!warning] Correction made during the citation pass
+> This note previously claimed `AuroraGlobalDBDataTransferBytes` was emitted on
+> the **primary**. It is not. AWS's metric table says, for every one of the five
+> metrics above, "This metric is available only in secondary AWS Regions."
+> The practical effect is *in your favour*: the liveness signal used in the
+> decision tree below lives in the Region that survives, not the one that died.
+
+Which lag metric to read is version-dependent, and AWS says so on the
+switchover/failover page verbatim: "For all versions of Aurora PostgreSQL-based
+global databases, and for Aurora MySQL-based global databases starting with
+engine versions 3.04.0 and higher or 2.12.0 and higher, use Amazon CloudWatch to
+view the `AuroraGlobalDBRPOLag` metric for all secondary DB clusters. For lower
+minor versions of Aurora MySQL-based global databases, view the
+`AuroraGlobalDBReplicationLag` metric instead." **On Aurora PostgreSQL,
+`AuroraGlobalDBRPOLag` is always the right one.**
+
+> [!note] A wrinkle AWS does not reconcile
+> The same paragraph ends "When you examine these metrics, do so from the current
+> primary cluster" — while the metric table says the metrics exist *only* in
+> secondary Regions. The reconciliation is almost certainly that you view the
+> secondary's metrics from a console session scoped to the primary, but AWS does
+> not say so. **Treat the metric table as authoritative on where the data lives**
+> (secondary Region, secondary cluster ID), because that is the statement your
+> alarms are actually built on.
 
 > [!warning] The dashboard inverts at failover
 > AWS, verbatim: *"Some CloudWatch metrics, such as replication lag, are only
-> available for secondary Regions."* Every one of the lag metrics above is
-> emitted **in the standby Region**, against the **standby cluster's**
-> identifier. After a failover the roles swap, so the metric moves to the *other*
-> Region and the *other* cluster ID. **Any alarm hard-coded to
-> `DBClusterIdentifier = <standby>` silently stops evaluating** — it does not
-> alarm, it goes `INSUFFICIENT_DATA` and most teams route that to nowhere.
-> Create both directions' alarms at build time. [[observability-multi-region]].
+> available for secondary Regions. Thus, a switchover changes how to view those
+> metrics and set alarms on them, and could require changes to any predefined
+> dashboards."* Every one of the metrics above is emitted **in the standby
+> Region**, against the **standby cluster's** identifier. After a failover the
+> roles swap, so the metric moves to the *other* Region and the *other* cluster
+> ID. **Any alarm hard-coded to `DBClusterIdentifier = <standby>` silently stops
+> evaluating** — it does not alarm, it goes `INSUFFICIENT_DATA` and most teams
+> route that to nowhere. Create both directions' alarms at build time.
+> [[observability-multi-region]].
 
 ### The SQL view — better than CloudWatch during an incident
 
@@ -652,9 +704,11 @@ AWS's own warning for exactly our topology, verbatim:
 
 With one secondary, "all secondaries are behind" is the same statement as "the
 secondary is behind". Every Helios pair is two-Region. **Leave it at `-1`.** It
-also blocks major version upgrades: "you can't perform a major version upgrade of
-the Aurora PostgreSQL DB engine if the recovery point objective (RPO) feature is
-turned on."
+also blocks major version upgrades. AWS, verbatim, from the [upgrade
+page](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-upgrade.html):
+"With an Aurora global database based on Aurora PostgreSQL, you can't perform a
+major version upgrade of the Aurora DB engine if the recovery point objective
+(RPO) feature is turned on."
 
 ---
 
@@ -683,19 +737,26 @@ application to hold a second connection to a far-away Region; it does not make
 the second Region able to accept writes if the first one is gone.
 
 **You connect to the secondary's *reader* endpoint** to use it — not its cluster
-endpoint, which on a secondary shows a status of `inactive`.
+endpoint. AWS, verbatim: "On a secondary cluster, the cluster endpoint displays a
+status of **inactive** because it doesn't handle write requests. You can still
+connect to the cluster endpoint, but only for read queries."
 
 ### Version support (Aurora PostgreSQL)
 
-Verbatim: "In Aurora PostgreSQL version 16 and higher major versions, global
-write forwarding is supported in all minor versions. For earlier Aurora
-PostgreSQL versions, global write forwarding is supported with version 15.4 and
-higher minor versions, and version 14.9 and higher minor versions. Write
+Verbatim, from [Using write forwarding in an Aurora PostgreSQL global
+database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-write-forwarding-apg.html)
+(verified 2026-09-22): "In Aurora PostgreSQL version 16 and higher major
+versions, global write forwarding is supported in all minor versions. For earlier
+Aurora PostgreSQL versions, global write forwarding is supported with version
+15.4 and higher minor versions, and version 14.9 and higher minor versions. Write
 forwarding is available in every AWS Region where Aurora PostgreSQL-based global
 databases are available."
 
 So — **available in `ca-west-1`**, since the global-database Region list covers
-it. No parity gap here.
+it. This is an *inference from two verified AWS statements* (Calgary is in the
+global-database Region table; write forwarding is available wherever that is),
+not a directly stated fact. AWS publishes no per-Region write-forwarding table.
+No parity gap here.
 
 Enabling or disabling it "doesn't cause downtime or a reboot", and the console
 note is worth knowing: if you pick "apply during the next maintenance window",
@@ -738,20 +799,30 @@ And the CloudWatch metrics, which are real and specific:
 | `AuroraForwardingWriterDMLThroughput` | Primary writer | Forwarded DML statements/sec processed |
 | `AuroraForwardingWriterOpenSessions` | Primary writer | Open sessions handling forwarded queries |
 | `AuroraForwardingWriterTotalSessions` | Primary writer | Total forwarded sessions |
-| `AuroraForwardingReplicaDMLLatency` | Secondary reader | **Average response time of forwarded DMLs** — the cost, in one number |
-| `AuroraForwardingReplicaReadWaitLatency` | Secondary reader | Wait time to become consistent with the primary's LSN. **This is the price of `SESSION`/`GLOBAL`, measured.** |
-| `AuroraForwardingReplicaCommitThroughput` | Secondary reader | Commits/sec in forwarded sessions |
-| `AuroraForwardingReplicaOpenSessions` | Secondary reader | Sessions using write forwarding |
-| `AuroraForwardingReplicaErrorSessionsLimit` | Secondary reader | **Sessions rejected because the connection limit was hit.** Alarm on this; see below |
+| `AuroraForwardingReplicaDMLLatency` | Secondary reader | "Average response time in milliseconds of forwarded DMLs on replica" — **the cost, in one number** |
+| `AuroraForwardingReplicaDMLThroughput` | Secondary reader | "Number of forwarded DML statements processed on this replica each second" |
+| `AuroraForwardingReplicaReadWaitLatency` | Secondary reader | "Average wait time in milliseconds that the replica waits to be consistent with the LSN of the primary cluster. The degree to which the reader DB instance waits depends on the `apg_write_forward.consistency_mode` setting." **This is the price of `SESSION`/`GLOBAL`, measured.** |
+| `AuroraForwardingReplicaCommitThroughput` | Secondary reader | "Number of commits in sessions forwarded by this replica each second" |
+| `AuroraForwardingReplicaOpenSessions` | Secondary reader | "The number of sessions that are using write forwarding on a replica instance" |
+| `AuroraForwardingReplicaErrorSessionsLimit` | Secondary reader | "Number of sessions rejected by the primary cluster because the limit for **max connections or max write forward connections** was reached." Alarm on this; see below |
+
+All eight names, units and descriptions above verified 2026-09-22 against the
+write-forwarding page's two CloudWatch tables. AWS states the first three "are
+all measured on the writer DB instance in the primary cluster" and the rest "are
+measured on each reader DB instance in a secondary cluster with write forwarding
+enabled."
 
 ### The connection-budget trap
 
-`apg_write_forward.max_forwarding_connections_percent` is **global-scope**,
-defaults to **25**, and is "the upper limit on database connection slots that can
-be used to handle queries forwarded from readers... expressed as a percentage of
+`apg_write_forward.max_forwarding_connections_percent` is **global-scope**, type
+`int`, defaults to **25**, valid range **1–100** (all four confirmed from AWS's
+parameter table), and is "the upper limit on database connection slots that can
+be used to handle queries forwarded from readers… expressed as a percentage of
 the `max_connections` setting for the writer DB instance in the primary cluster."
-AWS's own worked example: `max_connections = 800`, percent = 10, therefore 80
-simultaneous forwarded sessions.
+AWS's own worked example, verbatim: "if `max_connections` is `800` and
+`apg_write_forward.max_forwarding_connections_percent` is `10`, then the writer
+allows a maximum of 80 simultaneous forwarded sessions. **These connections come
+from the same connection pool managed by the `max_connections` setting.**"
 
 Read that carefully: **forwarded sessions consume the primary writer's
 `max_connections` budget.** Turning on write forwarding silently hands a quarter
@@ -759,11 +830,23 @@ of your primary's connection capacity to a remote Region. On a writer that is
 already connection-pressured, this is a production incident waiting for a busy
 Tuesday.
 
-And it compounds with RDS Proxy. AWS, flagged as **Important**:
+And it compounds with RDS Proxy. AWS, flagged as **Important** on [Using RDS
+Proxy with Aurora global
+databases](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-proxy-gdb.html):
 
 > If the DB cluster is part of a global database with write forwarding turned on,
 > reduce your proxy's `MaxConnectionsPercent` value by the quota that's allotted
-> for write forwarding.
+> for write forwarding. The write forwarding quota is set in the DB cluster
+> parameter `aurora_fwd_writer_max_connections_pct`.
+
+> [!warning] That parameter name is the Aurora **MySQL** one
+> `aurora_fwd_writer_max_connections_pct` is the Aurora MySQL parameter. The
+> Aurora PostgreSQL equivalent is `apg_write_forward.max_forwarding_connections_percent`
+> (same meaning, same default of 25). AWS's RDS Proxy page names only the MySQL
+> parameter even though the page covers both engines. **The guidance applies; the
+> parameter name in it does not, if you are on PostgreSQL.** Flagged here because
+> someone will copy that name into a Terraform parameter group and it will be
+> silently ignored.
 
 ### SQL you cannot use
 
@@ -777,15 +860,26 @@ aren't supported."
 Supported: DML (`INSERT`/`UPDATE`/`DELETE`), `SELECT FOR { UPDATE | NO KEY UPDATE
 | SHARE | KEY SHARE }`, `PREPARE`/`EXECUTE`, and `EXPLAIN` over those.
 
-> [!note] A documentation conflict worth knowing about
-> The Aurora PostgreSQL write-forwarding page **lists `SELECT FOR UPDATE` as
-> supported**. The general "Connecting to Aurora Global Database" page says write
-> forwarding "doesn't support certain MySQL or PostgreSQL operations, such as
-> making data definition language (DDL) changes or `SELECT FOR UPDATE`
-> statements." These two AWS pages disagree. The engine-specific page is the more
-> likely to be current, but **do not design around `SELECT FOR UPDATE` over write
-> forwarding without testing it in your own account.** Flagged as an open
-> question rather than resolved, because guessing here would be inventing.
+> [!note] A documentation conflict — confirmed real, both sides cited
+> **This was checked on 2026-09-22 and the contradiction is genuine, not a
+> misreading.**
+>
+> [Using write forwarding in an Aurora PostgreSQL global
+> database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-write-forwarding-apg.html)
+> lists under "You can use the following kinds of SQL statements with write
+> forwarding": "`SELECT FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }`
+> statements".
+>
+> [Connecting to Amazon Aurora Global
+> Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-connecting.html)
+> says: "write forwarding doesn't support certain MySQL or PostgreSQL operations,
+> such as making data definition language (DDL) changes or `SELECT FOR UPDATE`
+> statements."
+>
+> The engine-specific page is the more likely to be current and more specific,
+> but **do not design around `SELECT FOR UPDATE` over write forwarding without
+> testing it in your own account.** Carried to [[#Open questions]] rather than
+> resolved, because guessing here would be inventing.
 
 Isolation: `REPEATABLE READ` and `READ COMMITTED` work; **`SERIALIZABLE` is not
 supported**. And "If the transaction access mode is set to read only, write
@@ -989,9 +1083,15 @@ is irrelevant to an already-open connection. What happens instead:
 
 - If the old writer is *gone* (Region hard-down, packets black-holed), the
   sockets do not error immediately. Linux retransmits according to
-  `net.ipv4.tcp_retries2`, whose default of **15** works out to roughly **13–15
-  minutes** of exponential backoff before the kernel gives up. **That is your
-  entire RTO budget, spent doing nothing.**
+  `net.ipv4.tcp_retries2`. The kernel's own
+  [ip-sysctl documentation](https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt),
+  verbatim: *"The default value of 15 yields a hypothetical timeout of **924.6
+  seconds** and is a lower bound for the effective timeout. TCP will effectively
+  time out at the first RTO which exceeds the hypothetical timeout."*
+  **924.6 seconds is 15.4 minutes — and it is a lower bound.** That is your
+  entire RTO budget, spent doing nothing, before the socket even reports an
+  error. (This note previously said "roughly 13–15 minutes"; the documented
+  figure is slightly worse than that.)
 - If the old writer is *reachable but demoted*, the sockets stay healthy and
   writes fail with `ERROR: cannot execute INSERT in a read-only transaction`
   (SQLSTATE `25006`). Reads keep succeeding, so dashboards stay green while
@@ -1106,19 +1206,31 @@ Subscribing to them turns a runbook full of `sleep` statements into a runbook
 driven by facts, and it is how you avoid the "we waited two minutes and hoped"
 step that shows up in every first-draft DR procedure.
 
+> [!check] Verified 2026-09-22
+> Every event ID in the tables below was checked against [Amazon RDS event
+> categories and event messages for
+> Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_Events.Messages.html).
+> **All 21 IDs exist with the messages and categories shown.** None were wrong,
+> none were invented. The `Category` column is added from that page and is what
+> you actually filter an `aws_db_event_subscription` on.
+
 ### Switchover lifecycle
+
+All are **DB cluster** events in category **`global failover`**.
 
 | Event ID | Message | Why you care |
 |---|---|---|
-| `RDS-EVENT-0181` | "Global switchover to DB cluster *X* in Region *Y* started." | Start of clock |
+| `RDS-EVENT-0181` | "Global switchover to DB cluster *X* in Region *Y* started." | Start of clock. AWS's note adds: "The process can be delayed because other operations are running on the DB cluster" |
 | `RDS-EVENT-0183` | "Waiting for data synchronization across global cluster members. Current lags behind primary DB cluster: *…*" | **The sync wait, with the lag value in the message.** This is how you watch a switchover drain |
 | `RDS-EVENT-0423` | "Waiting for data synchronization with the target DB cluster. Current target DB cluster lag behind the primary DB cluster: *…*" | Same, target-specific |
 | `RDS-EVENT-0182` | "Old primary DB cluster *X* in Region *Y* successfully shut down." | **The write fence landed.** AWS's note: "The old primary instance in the global database isn't accepting writes. All volumes are synchronized." |
-| `RDS-EVENT-0184` | "New primary DB cluster *X* in Region *Y* was successfully promoted." | New writer exists |
+| `RDS-EVENT-0184` | "New primary DB cluster *X* in Region *Y* was successfully promoted." | New writer exists. AWS's note: "The volume topology of the global database is reestablished with the new primary volume" |
 | `RDS-EVENT-0185` | "Global switchover to DB cluster *X* in Region *Y* finished." | Done — but see the note: "Replicas might take long to come online after the failover completes" |
 | `RDS-EVENT-0186` / `RDS-EVENT-0187` | "…is cancelled." / "…failed." | Your abort signals |
 
 ### Failover lifecycle
+
+Also **DB cluster** events in category **`global failover`**.
 
 | Event ID | Message |
 |---|---|
@@ -1141,7 +1253,10 @@ recommendation of one warm reader in production is the right one.
 
 ### Write fencing — the two events that tell you whether you have split-brain
 
-These are **DB instance** events, category "notification, global database":
+These are **DB instance** events, category `notification, global database` —
+confirmed against the DB instance events table. Note that they are the *only*
+global-database events emitted against instances rather than clusters, which is
+why the Terraform below needs two subscriptions:
 
 | Event ID | Message | Meaning |
 |---|---|---|
@@ -1159,9 +1274,9 @@ recorded in the Region you cannot reach.
 
 ### The DNS event
 
-| Event ID | Message |
-|---|---|
-| `RDS-EVENT-0397` | "Aurora finished changing the DNS name that the global writer endpoint resolves to." |
+| Event ID | Source type | Category | Message |
+|---|---|---|---|
+| `RDS-EVENT-0397` | DB cluster | `global failover` | "Aurora finished changing the DNS name that the global writer endpoint resolves to." |
 
 This is the trigger AWS tells you to use instead of a timer: "you can check for
 the RDS event that informs you when Aurora observed the DNS changes for the
@@ -1178,17 +1293,23 @@ failover."
 
 ### Two events that are really Terraform warnings in disguise
 
-| Event ID | Message | What it is really telling you |
-|---|---|---|
-| `RDS-EVENT-0518` | "The engine version of DB cluster *X* has been changed from *A* to *B* **to align with the new primary cluster** *Y* **after a failover**." AWS: "No action required. This change is automatic and keeps your global database consistent." | **Aurora mutates `engine_version` on a member cluster, out of band, during a failover.** This is precisely why `lifecycle { ignore_changes = [engine_version] }` is load-bearing in [[aws-aurora-global-database#lifecycle blocks are load-bearing, not decoration]]. Without it, the first `terraform plan` after a failover proposes to change the engine version of your live database. |
-| `RDS-EVENT-0517` | "The *type* version upgrade for DB cluster *X* was canceled because **a failover occurred on the associated global database**. The DB cluster is now running engine version *V*. Retry the upgrade when the global database is available." | A failover during an upgrade **cancels the upgrade** and leaves the cluster on an indeterminate version. Which is exactly the state that disqualifies you from managed failover next time. Freeze upgrades during incidents |
+| Event ID | Category | Message | What it is really telling you |
+|---|---|---|---|
+| `RDS-EVENT-0518` | `maintenance` | "The engine version of DB cluster *X* has been changed from *A* to *B* **to align with the new primary cluster** *Y* **after a failover**." AWS: "No action required. This change is automatic and keeps your global database consistent." | **Aurora mutates `engine_version` on a member cluster, out of band, during a failover.** This is precisely why `lifecycle { ignore_changes = [engine_version] }` is load-bearing in [[aws-aurora-global-database#lifecycle blocks are load-bearing, not decoration]]. Without it, the first `terraform plan` after a failover proposes to change the engine version of your live database. |
+| `RDS-EVENT-0517` | **`failure`** | "The *{{upgrade\_type}}* version upgrade for DB cluster *X* was canceled because **a failover occurred on the associated global database**. The DB cluster is now running engine version *V*. Retry the upgrade when the global database is available." | A failover during an upgrade **cancels the upgrade** and leaves the cluster on an indeterminate version. Which is exactly the state that disqualifies you from managed failover next time. Freeze upgrades during incidents |
 
-And one preventative event: `RDS-EVENT-0424` — "The DB cluster *X* is running
-version *V*, which is higher than the target upgrade version *W* for the global
-cluster. **We don't recommend having a secondary cluster on a higher version than
-the global cluster, as it can cause issues during failover or switchover.**"
-Route this to the platform team's channel, not to nowhere. It is an early warning
-that you are drifting off the managed-failover path.
+Note the categories: `RDS-EVENT-0518` is `maintenance` and `RDS-EVENT-0517` is
+`failure`, **neither of which is `global failover`**. A subscription filtered to
+`global failover` alone will miss both of the events that matter most to
+Terraform.
+
+And one preventative event: `RDS-EVENT-0424`, category `maintenance`, DB cluster
+— "The DB cluster *X* is running version *V*, which is higher than the target
+upgrade version *W* for the global cluster. **We don't recommend having a
+secondary cluster on a higher version than the global cluster, as it can cause
+issues during failover or switchover.** Consider upgrading your global cluster to
+match." Route this to the platform team's channel, not to nowhere. It is an early
+warning that you are drifting off the managed-failover path.
 
 ### Wiring it up
 
@@ -1229,6 +1350,21 @@ resource "aws_db_event_subscription" "global_db_instances" {
 emitted against instances, and during an incident you will be creating
 instances. A subscription scoped to the instances that existed at plan time will
 miss exactly the ones you care about.
+
+> [!warning] One thing in that snippet is *not* verified
+> The `global failover` category string is confirmed — AWS's event table uses it
+> verbatim for `RDS-EVENT-0181`–`0187`, `0238`–`0241`, `0397`, `0423` and `0519`.
+> But `RDS-EVENT-0390`/`0391` are listed under the composite category
+> **`notification, global database`**, and AWS's documentation does not state
+> whether that is one subscribable category named `global database` plus
+> `notification`, or a single string. **Resolve it in-account before trusting the
+> instance subscription**, with:
+> ```bash
+> aws rds describe-event-categories --source-type db-instance
+> aws rds describe-event-categories --source-type db-cluster
+> ```
+> This is the one place in this note where an automation would be built on a
+> string that first-party docs do not pin down. Do not guess it.
 
 ---
 
@@ -1463,24 +1599,38 @@ difference between a targeted reconciliation and a forensic one. See
 
 ### Topology limits
 
-| Limit | Value | Source |
+All verified 2026-09-22 against [Configuration requirements of an Amazon Aurora
+global
+database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.configuration.requirements.html).
+
+| Limit | Value | AWS's wording |
 |---|---|---|
-| Secondary Regions | **10 maximum**, at least 1 required | Configuration requirements |
-| Writer instances | 1 in the primary, **0** in every secondary | Configuration requirements |
-| Readers per secondary cluster | **16** (vs 15 for a standalone cluster) | "The secondary cluster is read-only, so it can support up to 16 read-only DB instances rather than the usual limit of 15" |
-| Readers in the **primary** cluster | **15 − *s***, where *s* = number of secondary Regions | Configuration requirements table |
-| Two clusters in the same Region | **Not allowed.** "no two Aurora DB clusters in an Aurora global database can be in the same AWS Region" | Configuration requirements |
-| Cluster names | **Globally unique across Regions.** "You can't use the same name for different Aurora DB clusters even though they're in different Regions" | Configuration requirements |
+| Secondary Regions | **10 maximum**, at least 1 required | "At least one secondary AWS Region is required, but an Aurora global database can have up to 10 secondary AWS Regions" |
+| Writer instances | 1 in the primary, **0** in every secondary | Requirements table, "Writer instances" row |
+| Readers per secondary cluster | **16 (total)**, vs 15 for a standalone cluster | Requirements table, "Read-only instances (Aurora replicas), per Aurora DB cluster": primary 15 (max), secondary 16 (total). The *why* is on the [Aurora Global Database overview page](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html): "The secondary cluster is read-only, so it can support up to 16 read-only DB instances rather than the usual limit of 15 for a single Aurora cluster" |
+| Readers in the **primary** cluster | **15 − *s***, where *s* = number of secondary Regions | Requirements table row: "Read-only instances (max allowed, given actual number of secondary Regions) \| 15 - *s* \| *s* = total number of secondary AWS Regions" |
+| Two clusters in the same Region | **Not allowed** | "no two Aurora DB clusters in an Aurora global database can be in the same AWS Region" |
+| Cluster names | **Globally unique across Regions** | "The names you choose for each of your Aurora DB clusters must be unique, across all AWS Regions. You can't use the same name for different Aurora DB clusters even though they're in different Regions" |
+| Instance class | **db.r5 or higher** | "An Aurora global database requires DB instance classes that are optimized for memory-intensive applications… We recommend that you use a db.r5 or higher instance class" |
+| Serverless v2 floor | **8 ACUs in the primary Region** | "For a global database with Aurora serverless, the minimum recommended capacity for the DB cluster in the primary AWS Region is 8 ACUs" |
 
 > [!note] The 15 − *s* rule is an obscure one worth knowing
 > **Each secondary Region costs you one reader slot on the primary cluster.** With
 > one secondary you can run 14 readers in the primary, not 15. Irrelevant at our
 > scale, invisible in the docs unless you read the table carefully, and it will
 > bite exactly one person, once, at the worst time.
+>
+> Note that the two sources sit on different pages: the *numbers* are in the
+> configuration-requirements table, the *explanation* is in the "Advantages"
+> section of the overview page. Both are cited above.
 
 ### Engine version parity — the control that decides which failover path you get
 
-Three tiers, and the difference between them is the difference between B1 and B2:
+All of this section is verified against [Upgrading an Amazon Aurora global
+database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-upgrade.html),
+section "Patch level compatibility for managed cross-Region switchovers and
+failovers" (checked 2026-09-22). Three tiers, and the difference between them is
+the difference between B1 and B2:
 
 | Operation | Version requirement |
 |---|---|
@@ -1553,12 +1703,17 @@ Ordered by how likely it is to be the thing that stops you:
 
 ### Feature interactions
 
+All quoted wording below was verified on 2026-09-22. Unless another page is
+named, the source is the [Limitations of Amazon Aurora Global
+Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html#aurora-global-database.limitations)
+section.
+
 | Feature | With Aurora Global Database | Consequence for failover |
 |---|---|---|
 | **Backtrack** | **Not supported.** Listed flatly under "Aurora Global Database currently doesn't support the following Aurora features: Backtracking in Aurora" | No "rewind 30 minutes" escape hatch after a bad deploy. PITR restore is your only in-place undo, and it is slow |
-| **Cloning** | Aurora fast cloning is **Region-local**: "You can't create a clone in a different AWS Region from the source Aurora DB cluster." | You cannot clone across Regions to seed or to test. Rehearsal clones live in one Region only |
-| **Serverless v2** | Supported for readers. **Minimum recommended capacity 8 ACUs — "applies only to the primary AWS Region."** Also: global databases are listed among features that "can increase resource usage and **prevent the database from scaling down to minimum capacity**" | A Serverless v2 standby reader is warm (no instance-creation wait) but **will not be at production capacity the instant it is promoted**: "The time it takes… to scale from its minimum capacity to its maximum capacity depends on the difference between its minimum and maximum ACU values." A very low floor means a slow ramp under a full production workload immediately post-failover. Set the floor for the *post-promotion* load, not the idle load |
-| **Blue/Green Deployments** | Supported, and it mirrors the whole topology: "including the primary cluster and all associated secondary regions across multiple AWS Regions". Switchover downtime "typically under one minute" | **Global failover is allowed during a B/G switchover; global switchover is not.** DR is maintained but the interaction adds a roll-forward/roll-back step |
+| **Cloning** | Aurora fast cloning is **Region-local**. [Cloning limitations](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Managing.Clone.html#Aurora.Managing.Clone.Limitations), verbatim: "You can't create a clone in a different AWS Region from the source Aurora DB cluster." | You cannot clone across Regions to seed or to test. Rehearsal clones live in one Region only |
+| **Serverless v2** | Supported for readers. [Performance and scaling for Aurora serverless](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2.setting-capacity.html), verbatim: "Aurora global databases – 8 ACUs (**applies only to the primary AWS Region**)". Same page lists "Aurora global databases" first among features that "can increase resource usage and **prevent the database from scaling down to minimum capacity**" | A Serverless v2 standby reader is warm (no instance-creation wait) but **will not be at production capacity the instant it is promoted**. AWS, verbatim: "The time it takes for an Aurora serverless DB instance to scale from its minimum capacity to its maximum capacity depends on the difference between its minimum and maximum ACU values… if you specify a relatively large maximum capacity and the DB instance spends most of its time near that capacity, consider increasing the minimum ACU setting." **AWS's own advice is to raise the floor.** Set it for the *post-promotion* load, not the idle load |
+| **Blue/Green Deployments** | Supported, and it mirrors the whole topology. [Using Blue/Green Deployments for Amazon Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-bluegreen.html), verbatim: "including the primary cluster and all associated secondary regions across multiple AWS Regions"; switchover "with downtime typically under one minute" | **Verbatim: "Global failover is supported during a blue/green switchover, but Global switchover is not supported during a blue/green switchover."** And: "When you initiate a global failover during an RDS blue/green switchover, the target region automatically rolls back to the blue environment or rolls forward to the green environment before the global failover occurs." DR is maintained but the interaction adds an unbudgeted step |
 | **Performance Insights** | Per-cluster, **not inherited**: "When you add a new secondary AWS Region to an Aurora global database that's already using Performance Insights, be sure that you enable Performance Insights in the newly added cluster" | After failover, if the standby never had PI enabled, you are debugging your new production database blind. Enable it on both clusters at build time. Note also "the associated Performance Insights URL is different for each DB instance" — bookmarked dashboards break |
 | **Database Activity Streams** | "You start a database activity stream on each DB cluster separately. Each cluster delivers audit data to its own Kinesis stream within its own AWS Region" | Your audit trail moves Regions at failover. Compliance owners need to know. [[data-residency]] |
 | **Aurora Auto Scaling** | **Not supported for secondary clusters** | No elastic ramp on the new primary. Adding capacity is a scripted `create-db-instance`, post-RTO |
@@ -1727,31 +1882,234 @@ aws rds --region "$STANDBY_REGION" failover-global-cluster \
 | 3 promote (B2 detach) | **No.** The global cluster is destroyed |
 | 5 reconnect | Mechanically yes, practically no |
 
+## Open questions
+
+These are genuine unknowns, not unfinished citation work. Each one is a thing the
+docs do not answer and a game day or an in-account test would.
+
+1. **Does `SELECT FOR UPDATE` actually work over write forwarding on Aurora
+   PostgreSQL?** Two AWS pages contradict each other (both cited in
+   [[#SQL you cannot use]]). Only an in-account test resolves it. Only matters if
+   write forwarding is ever turned on.
+2. **What is the exact subscribable event category for `RDS-EVENT-0390`/`0391`?**
+   AWS's table shows the composite string "notification, global database" and
+   does not say how to express that in an `aws_db_event_subscription`. Resolve
+   with `aws rds describe-event-categories --source-type db-instance` before the
+   fencing alarm is built. **This is the only automation input in this note that
+   first-party docs do not pin down.**
+3. **What is our actual switchover duration?** AWS publishes no figure — it says
+   only "Your database is unavailable for a short time" and that duration is
+   proportional to lag. The quarterly switchover is the only way to learn it.
+4. **What is our actual managed-failover duration?** AWS says "within a few
+   minutes" and its launch post says "typically a minute". Neither is an SLA and
+   no independent measurement of a real Region event exists publicly (see
+   the "Could not verify" list in [[#Sources]]). A game day is mandatory before the
+   15-minute RTO is signed off.
+5. **How long does the old primary's rebuild take for our data volume on the
+   Montreal↔Calgary leg?** AWS publishes "a few minutes to several hours" for
+   *other secondaries* and **no figure at all** for the old primary's rebuild.
+   Until 0241 fires you have no DR, so this number sizes a real risk window.
+6. **Are there any logical replication slots on the cluster today?** CDC,
+   Debezium, or an analytics sink consuming from this database turns failover
+   into a multi-system recovery. Find out at design time.
+7. **Which instance classes are orderable for `aurora-postgresql` in
+   `ca-west-1`?** Run the `describe-orderable-db-instance-options` diff in
+   [[#`ca-west-1` parity, specifically]]. Not a feature gap, but it sizes the
+   post-promotion capacity story.
+8. **RTO definition** — 15 minutes from *incident start* or from *decision to
+   fail over*? The runbook below assumes the latter (the clock starts at the 1.4
+   approval). Flagged in [[research-brief]] as an open thread for the user.
+
 ## Still to research
 
-**The whole note needs a citation pass — that is the priority, ahead of any new
-content.** Work through it claim by claim and either attach a real AWS source or
-delete the claim. Verify these first, in this order, because the most load-bearing
-assertions are the least checkable:
+The citation pass is **done** — see [[#Sources]]. What remains is new content,
+not verification:
 
-1. **`ca-west-1` Aurora Global Database support** — asserted in the first TL;DR
-   bullet. If it is wrong, the CA pair needs an entirely different database DR
-   design, so this single claim carries more weight than anything else here.
-   Check the supported-Regions table directly. Cross-ref [[region-pair-selection]].
-2. **CloudWatch metric names** — `AuroraGlobalDBRPOLag`,
-   `AuroraGlobalDBReplicationLag` and any others used. These are quoted as if
-   exact and would be copied straight into alarms.
-3. **AWS's own timing language** — anything phrased as an AWS quote
-   ("within a few minutes" and similar) needs the page it came from, or must be
-   rewritten as an estimate and labelled as one.
-4. **API and event names** — the failover API calls and the RDS event
-   identifiers in "The RDS events to key automation off". Automation would be
-   built directly on these.
-5. **Write-forwarding consistency levels** and engine/version support.
-6. **Limits** in "Limits, parity and what blocks a failover" — maximum secondary
-   Regions, version-parity rules, and the Serverless v2 / Blue-Green / Backtrack
-   interactions.
+1. **Terraform implementation** for the event subscriptions and alarms in this
+   note, beyond the snippet in [[#Wiring it up]]. The cluster/instance Terraform
+   itself lives in [[aws-aurora-global-database#Terraform implementation]] and
+   should not be duplicated here.
+2. **Cost** — the standby reader's 24/7 instance-hours, `AuroraGlobalDBReplicatedWriteIO`,
+   cross-Region transfer, and the one-off spike during an old-primary rebuild.
+   Belongs in [[cost-model]]; this note should link, not restate.
+3. **Migration path** — deliberately deferred to
+   [[aws-aurora-global-database#Migration path from single-region]] and
+   [[rds-vs-aurora-decision]]. This note is the *operational* slice and has no
+   separate migration story.
+4. **Decisions to make** — the three real forks in this note (write forwarding
+   on/off, CNAME indirection or not, quarterly switchover or not) each carry a
+   recommendation inline. Consolidating them into one table would help a reviewer
+   but adds no new research.
 
-Then add the template sections this note is missing: Terraform implementation,
-Migration path (or defer explicitly to [[rds-aurora-migration-path]]), Cost,
-Decisions to make, Open questions, and **Sources**.
+## Sources
+
+Every URL below was fetched and read on **2026-09-22**. Quotes in the note are
+verbatim from these pages unless explicitly labelled as an inference or an
+estimate.
+
+### First-party AWS documentation
+
+- [Supported Regions and DB engines for Aurora global databases](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.Aurora_Fea_Regions_DB-eng.Feature.GlobalDatabase.html)
+  — **the `ca-west-1` finding, and the single most load-bearing check in this
+  note.** Canada West (Calgary) is present in both the Aurora PostgreSQL and
+  Aurora MySQL tables, with a row identical to Canada (Central).
+- [Using switchover or failover in Amazon Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-disaster-recovery.html)
+  — **the primary source for this note.** The three switchover use cases; the
+  "healthy state" restriction; the switchover mechanism step order; "Your
+  database is unavailable for a short time"; managed failover's "doesn't wait for
+  data to synchronize"; "guarantees that the data is in a transactionally
+  consistent state"; the write-fencing paragraph including where the events are
+  recorded; the `rds:unplanned-global-failover-{{name}}-{{timestamp}}` snapshot
+  and the note that it "is a system snapshot that's subject to the backup
+  retention period configured on the old primary cluster"; **"Typically, the
+  chosen secondary cluster assumes the primary role within a few minutes"**; the
+  secondary-rebuild "a few minutes to several hours"; the full manual
+  detach-and-promote procedure; "take applications offline"; the DNS-TTL-5-seconds
+  advice; the `--region` semantics for both commands; `--allow-data-loss`
+  ("Explicitly make this a failover operation instead of a switchover
+  operation"); the five post-promotion configuration items; and the complete
+  `rds.global_db_rpo` behaviour including the two-Region warning and the
+  20–2,147,483,647 second range.
+- [Cluster-level CloudWatch metrics for Amazon Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html#Aurora.AuroraMySQL.Monitoring.Metrics.clusters)
+  — all five `AuroraGlobalDB*` metric names, units and descriptions. **Source of
+  the one factual correction in this pass:** every one of them, including
+  `AuroraGlobalDBDataTransferBytes`, "is available only in secondary AWS Regions".
+- [Monitoring an Amazon Aurora global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-monitoring.html)
+  — the `aurora_global_db_status()` and `aurora_global_db_instance_status()`
+  column lists and definitions; the `-1` on the primary's row in AWS's own
+  example output; the hour-long-transaction worked example showing
+  `durability_lag_in_msec` climbing while `rpo_lag_in_msec` stays at 0; the
+  Performance Insights non-inheritance text; and the Database Activity Streams
+  per-Region Kinesis statement.
+- [Amazon RDS event categories and event messages for Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_Events.Messages.html)
+  — **all 21 event IDs used in this note, verified individually.** Confirms
+  categories: `global failover` for `RDS-EVENT-0181`–`0187`, `0238`–`0241`,
+  `0397`, `0423`, `0519` (DB cluster); `notification, global database` for
+  `RDS-EVENT-0390`/`0391` (DB **instance**); `maintenance` for `0518` and `0424`;
+  `failure` for `0517`; `notification` for `0385` (DB instance).
+- [Configuration requirements of an Amazon Aurora global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.configuration.requirements.html)
+  — the 10-secondary maximum, the writer/reader counts, **the 15 − *s* primary
+  reader rule verbatim**, the same-Region prohibition, the globally-unique naming
+  rule, "db.r5 or higher", and the 8-ACU Serverless v2 primary floor.
+- [Using Amazon Aurora Global Database (overview and limitations)](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html)
+  — "dedicated infrastructure, with latency typically under a second"; the
+  16-vs-15 reader explanation; and the limitations list: Backtracking
+  unsupported, Aurora Auto Scaling unsupported for secondary clusters, no
+  individual stop/start, Secrets Manager unsupported, cluster cache management
+  unsupported on APG secondaries, no renaming a member cluster, the terminal
+  `inaccessible-encryption-credentials` state with no `-recoverable` variant, the
+  RDS-PostgreSQL-replica-derived-primary restriction ("Attempts to do so time
+  out"), and automatic minor version upgrade having "no effect".
+- [Upgrading an Amazon Aurora global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-upgrade.html)
+  — the patch-level compatibility table (APG 15+/14.5+/13.8+/12.12+/11.17+;
+  Aurora MySQL "No minor versions"); **the exact list of poisoned patch versions
+  (16.1.6, 16.2.4, 16.3.2, 16.4.2; 15.3.8, 15.4.9, 15.5.6, 15.6.4, 15.7.2,
+  15.8.2; 14.8.8, 14.9.9, 14.10.6, 14.11.4, 14.12.2, 14.13.2)**; "upgrade all
+  secondary clusters before upgrading the primary cluster"; the
+  `modify-global-cluster` managed minor upgrade, its automatic rollback, its
+  Aurora-PostgreSQL-only scope, and the caveat that "Patch version upgrades
+  continue to use existing system-update maintenance actions"; and the
+  major-upgrade block when `rds.global_db_rpo` is on.
+- [Using write forwarding in an Aurora PostgreSQL global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-write-forwarding-apg.html)
+  — the version/Region availability statement; the four
+  `apg_write_forward.consistency_mode` values with AWS's description of each and
+  the `SESSION` default; the full parameter table (scope, type, default, range)
+  including `max_forwarding_connections_percent` = Global / int / 25 / 1–100 and
+  the `max_connections = 800` worked example; the supported and unsupported SQL
+  lists (including `SELECT FOR UPDATE` as **supported**); `SERIALIZABLE`
+  unsupported; read-only access mode disabling forwarding; all eight
+  `AuroraForwarding*` CloudWatch metrics; all seven `IPC:AuroraWriteForward*`
+  wait events; "Enabling or disabling write forwarding doesn't cause downtime or
+  a reboot"; the maintenance-window override; and the
+  `GlobalWriteForwardingStatus` values and the meaning of `null`.
+- [Connecting to Amazon Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-connecting.html)
+  — the global writer endpoint format and auto-update behaviour; the
+  recommendation to move off the primary's cluster endpoint; "can take a long
+  time depending upon your Domain Name Service (DNS) caching duration"; the
+  cross-VPC IP reachability caveat; the rename-breaks-the-endpoint warning; the
+  best-effort/split-brain sentence; the secondary cluster endpoint showing status
+  `inactive`; and **the write-forwarding statement that contradicts the
+  engine-specific page on `SELECT FOR UPDATE`**.
+- [Using RDS Proxy with Aurora global databases](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-proxy-gdb.html)
+  — the request-queuing behaviour through the promotion gap; the old primary's
+  proxy default endpoint still accepting writes during the switch and then
+  failing; the `MaxConnectionsPercent` reduction guidance (which names only the
+  Aurora **MySQL** parameter); and "RDS Proxy doesn't support the `SESSION` value
+  for the `apg_write_forward.consistency_mode` parameter".
+- [Removing a cluster from an Amazon Aurora global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-detaching.html)
+  — detaching makes a cluster "a standalone provisioned Aurora DB cluster with
+  full read/write capabilities"; "The Aurora global database might remain in the
+  **Databases** list, with zero Regions and AZs"; and the ARN form of
+  `remove-from-global-cluster`.
+- [Using Blue/Green Deployments for Amazon Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-bluegreen.html)
+  — topology mirroring "including the primary cluster and all associated
+  secondary regions across multiple AWS Regions"; "downtime typically under one
+  minute"; and verbatim: "Global failover is supported during a blue/green
+  switchover, but Global switchover is not supported during a blue/green
+  switchover."
+- [Performance and scaling for Aurora serverless](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2.setting-capacity.html)
+  — "Aurora global databases – 8 ACUs (applies only to the primary AWS Region)";
+  global databases listed among features that "prevent the database from scaling
+  down to minimum capacity"; and the min-to-max scaling-time paragraph with
+  AWS's own advice to raise the minimum ACU setting.
+- [Cloning a volume for an Amazon Aurora DB cluster](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Managing.Clone.html#Aurora.Managing.Clone.Limitations)
+  — "You can't create a clone in a different AWS Region from the source Aurora DB
+  cluster."
+- API reference pages for the three operations named throughout:
+  [`SwitchoverGlobalCluster`](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_SwitchoverGlobalCluster.html),
+  [`FailoverGlobalCluster`](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_FailoverGlobalCluster.html),
+  [`RemoveFromGlobalCluster`](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_RemoveFromGlobalCluster.html)
+  — all three names confirmed by the CLI/API subsections of the
+  switchover/failover and detaching pages.
+
+### Inherited from the parent note
+
+These were verified during the research for
+[[aws-aurora-global-database]] and are cited there in full; this note relies on
+them but did not re-fetch them in this pass:
+
+- [Amazon Aurora Global Database supports failover — AWS What's New, Aug 2023](https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-aurora-global-database-failover/)
+  — the "typically a minute" phrasing quoted in [[#Timing]].
+- [How a large financial AWS customer implemented HA and DR for Amazon Aurora PostgreSQL using Global Database and Amazon RDS Proxy — AWS Database Blog](https://aws.amazon.com/blogs/database/how-a-large-financial-aws-customer-implemented-ha-and-dr-for-amazon-aurora-postgresql-using-global-database-and-amazon-rds-proxy/)
+  — the RDS Proxy buffering architecture referenced in [[#RDS Proxy]].
+
+### Could not verify
+
+Stated plainly rather than dressed up. Nothing in this list is presented as fact
+in the note body.
+
+- **No independent, non-AWS measurement of an unplanned Aurora Global Database
+  cross-Region failover during a real Region event.** Every timing figure in
+  public circulation originates with AWS. This was also the parent note's
+  finding and nothing new was found. Recorded as a finding, not a gap in
+  searching. The 15-minute RTO therefore rests on vendor claims plus whatever
+  your own game day measures.
+- **AWS publishes no switchover duration figure.** Only "Your database is
+  unavailable for a short time" and the statement that duration is proportional
+  to lag. Any specific number seen elsewhere is a blog illustration, not a
+  commitment.
+- **AWS publishes no duration for the old primary's rebuild after a managed
+  failover.** The "a few minutes to several hours" figure is stated for
+  *additional secondary* clusters. Applying it to the old primary is a **labelled
+  inference** in [[#But the "wait" is doing a lot of work — what actually gets
+  rebuilt]], not a quote.
+- **The subscribable event-category string for `RDS-EVENT-0390`/`0391`.** AWS's
+  table shows "notification, global database" and no page explains how to express
+  it in a subscription. Flagged in-place and in [[#Open questions]]; must be
+  resolved with `describe-event-categories` before the fencing alarm is trusted.
+- **Write forwarding availability in `ca-west-1` is an inference**, not a stated
+  fact. AWS says write forwarding is available wherever APG global databases are,
+  and Calgary is in that table. Both halves are verified; the conjunction is
+  ours. AWS publishes no per-Region write-forwarding table.
+- **The `SELECT FOR UPDATE` contradiction is unresolved.** Both AWS pages are
+  cited. Neither is dated. No third-party source was found that settles it.
+- **Two of the non-Aurora claims in [[#The cached-DNS / connection-pool problem,
+  in detail]]** remain uncited: the JVM `networkaddress.cache.ttl` defaults
+  (stated in the note as "cache forever on older JREs with a SecurityManager,
+  30 seconds commonly cited on modern JDKs") and the CoreDNS 30-second default
+  cache TTL. Both are widely-documented general platform behaviour rather than
+  Aurora facts, and the note's advice — pin the value explicitly rather than rely
+  on the default — is correct regardless of which default applies. But they are
+  **not verified here**. The third claim in that subsection, `tcp_retries2`, *is*
+  now verified against the Linux kernel documentation and was **corrected** in
+  the process (924.6 s lower bound, not "13–15 minutes").
